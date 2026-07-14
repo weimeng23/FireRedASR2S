@@ -935,6 +935,7 @@ git commit -m "feat(fireredlid): add configurable inference backends"
 ### Task 6: Export and verify a dynamic FP32 ONNX Encoder on macOS
 
 **Files:**
+- Modify: `.gitignore`
 - Create: `runtime/fireredlid/pyproject.toml`
 - Create: `runtime/fireredlid/export_encoder_onnx.py`
 - Create: `runtime/fireredlid/verify.py`
@@ -1073,7 +1074,7 @@ The CLI verifies frame lengths corresponding to 1, 5, 15, 30, and 60 seconds wit
 
 Run: `python3 -m pytest tests/fireredlid/test_onnx_export.py -v`
 
-Expected: `1 passed`.
+Expected: `2 passed`.
 
 Run: `python3 runtime/fireredlid/export_encoder_onnx.py --help`
 
@@ -1082,7 +1083,7 @@ Expected: exit code `0` and options for `--model-dir` and `--output-dir`.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add runtime/fireredlid/pyproject.toml runtime/fireredlid/export_encoder_onnx.py runtime/fireredlid/verify.py tests/fireredlid/test_onnx_export.py
+git add .gitignore runtime/fireredlid/pyproject.toml runtime/fireredlid/export_encoder_onnx.py runtime/fireredlid/verify.py tests/fireredlid/test_onnx_export.py
 git commit -m "feat(fireredlid): add dynamic ONNX encoder export"
 ```
 
@@ -1314,7 +1315,6 @@ git commit -m "feat(fireredlid): add TensorRT engine contract"
 ### Task 8: Add verification, benchmark reporting, and handoff documentation
 
 **Files:**
-- Modify: `.gitignore`
 - Modify: `fireredasr2s/fireredlid/lid.py`
 - Modify: `fireredasr2s/fireredlid/models/fireredlid_aed.py`
 - Create: `runtime/fireredlid/benchmark.py`
@@ -1434,7 +1434,7 @@ Create `runtime/fireredlid/example_manifest.jsonl` with exactly:
 {"uttid":"hello_en","wav":"assets/hello_en.wav"}
 ```
 
-Append `/runtime/fireredlid/artifacts/` to `.gitignore`; do not ignore `example_manifest.jsonl`, `profiles.yaml`, or the runtime source files.
+Confirm `/runtime/fireredlid/artifacts/` remains in `.gitignore`; do not ignore `example_manifest.jsonl`, `profiles.yaml`, or the runtime source files.
 
 - [ ] **Step 5: Run the full Mac-safe unit suite**
 
@@ -1470,7 +1470,7 @@ Expected: export completes with dynamic inputs; lengths and mask are independent
 - [ ] **Step 8: Commit**
 
 ```bash
-git add .gitignore fireredasr2s/fireredlid/lid.py fireredasr2s/fireredlid/models/fireredlid_aed.py runtime/fireredlid/benchmark.py runtime/fireredlid/verify.py runtime/fireredlid/example_manifest.jsonl runtime/fireredlid/README.md tests/fireredlid/test_benchmark.py
+git add fireredasr2s/fireredlid/lid.py fireredasr2s/fireredlid/models/fireredlid_aed.py runtime/fireredlid/benchmark.py runtime/fireredlid/verify.py runtime/fireredlid/example_manifest.jsonl runtime/fireredlid/README.md tests/fireredlid/test_benchmark.py
 git commit -m "test(fireredlid): add inference verification and benchmarks"
 ```
 

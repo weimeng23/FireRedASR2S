@@ -8,5 +8,6 @@ text
 wav.scp
 utt2event
 pretrained_models/
+/runtime/fireredlid/artifacts/
 *.swp
 *.swo
