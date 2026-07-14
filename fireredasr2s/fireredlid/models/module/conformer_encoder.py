@@ -34,21 +34,17 @@ class ConformerEncoder(nn.Module):
 
         pos_emb = self.dropout(self.positional_encoding(embed_output))
 
-        enc_outputs = []
         for enc_layer in self.layer_stack:
             enc_output = enc_layer(enc_output, pos_emb, slf_attn_mask=src_mask,
                                    pad_mask=src_mask)
-            enc_outputs.append(enc_output)
 
         return enc_output, input_lengths, src_mask
 
     def padding_position_is_0(self, padded_input, input_lengths):
-        N, T = padded_input.size()[:2]
-        mask = torch.ones((N, T)).to(padded_input.device)
-        for i in range(N):
-            mask[i, input_lengths[i]:] = 0
-        mask = mask.unsqueeze(dim=1)
-        return mask.to(torch.uint8)
+        time_index = torch.arange(
+            padded_input.size(1), device=padded_input.device)
+        mask = time_index.unsqueeze(0) < input_lengths.unsqueeze(1)
+        return mask.unsqueeze(dim=1).to(torch.uint8)
 
 
 class RelPosEmbConformerBlock(nn.Module):
