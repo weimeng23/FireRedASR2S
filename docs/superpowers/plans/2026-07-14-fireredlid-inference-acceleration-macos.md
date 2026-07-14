@@ -1234,7 +1234,7 @@ Implement `sha256_file()` as a streaming 1 MiB chunk reader. In `TensorRTEncoder
 ```python
 def encode(self, features, feature_lengths):
     features = features.to(device="cuda", dtype=torch.float16).contiguous()
-    feature_lengths = feature_lengths.to(device="cuda", dtype=torch.int32).contiguous()
+    feature_lengths = feature_lengths.to(device="cuda", dtype=torch.int64).contiguous()
     self._validate_shape(tuple(features.shape))
     self.context.set_input_shape("features", tuple(features.shape))
     self.context.set_input_shape("feature_lengths", tuple(feature_lengths.shape))
@@ -1272,7 +1272,7 @@ def build_engine(onnx_path, output_dir, profile_path, checkpoint_path):
     builder = trt.Builder(trt.Logger(trt.Logger.INFO))
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     parser = trt.OnnxParser(network, trt.Logger(trt.Logger.INFO))
-    if not parser.parse(Path(onnx_path).read_bytes()):
+    if not parser.parse_from_file(str(Path(onnx_path).resolve())):
         errors = "\n".join(str(parser.get_error(index)) for index in range(parser.num_errors))
         raise RuntimeError(errors)
     config = builder.create_builder_config()
@@ -1291,13 +1291,13 @@ def build_engine(onnx_path, output_dir, profile_path, checkpoint_path):
     write_manifest(output_dir, profile_config, checkpoint_path, onnx_path, trt.__version__)
 ```
 
-`write_manifest()` stores SHA-256 for the checkpoint and ONNX, GPU name, PyTorch/TensorRT/CUDA versions, precision, tensor names, and flattened min/opt/max profile shapes.
+`write_manifest()` stores SHA-256 for the checkpoint and the complete ONNX bundle (protobuf plus every external tensor file), GPU name, PyTorch/TensorRT/CUDA versions, precision, tensor names, and flattened min/opt/max profile shapes.
 
 - [ ] **Step 7: Run Mac-safe tests and CLI help**
 
 Run: `python3 -m pytest tests/fireredlid/test_tensorrt_backend.py -v`
 
-Expected: `3 passed` without importing TensorRT.
+Expected: `4 passed` without importing TensorRT.
 
 Run: `python3 runtime/fireredlid/build_engine.py --help`
 

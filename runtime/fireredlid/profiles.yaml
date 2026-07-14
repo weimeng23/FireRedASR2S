@@ -1,0 +1,11 @@
+schema_version: 1
+profiles:
+  - name: default
+    features:
+      min: [1, 1, 80]
+      opt: [1, 1000, 80]
+      max: [4, 6000, 80]
+    feature_lengths:
+      min: [1]
+      opt: [1]
+      max: [4]
