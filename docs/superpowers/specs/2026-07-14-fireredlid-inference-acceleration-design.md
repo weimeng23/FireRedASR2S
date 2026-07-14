@@ -69,7 +69,7 @@ Feature Frontend 与 EncoderBackend 在代码职责上独立，通过 `FeatureBa
 ```text
 Feature Frontend：音频 -> 每条音频独立的已做 CMVN 的 [T_i, 80] 特征
 Batch Planner：List[[T_i, 80]] -> padded_features [B, T, 80] + feature_lengths [B]
-EncoderBackend：FeatureBatch -> encoder_outputs + encoder_mask
+EncoderBackend：FeatureBatch -> encoder_outputs + encoder_lengths + encoder_mask
 ```
 
 当前 `FeatExtractor` 同时负责逐条 FBank/CMVN 和整个 batch 的 padding。实现时将其整理为“逐条特征计算”和“组 batch/padding”两个步骤，但保持 `kaldi_native_fbank`、CMVN 数学公式以及“先 CMVN、后 padding”的顺序不变。
@@ -78,10 +78,10 @@ EncoderBackend：FeatureBatch -> encoder_outputs + encoder_mask
 
 ```text
 输入：features [B, T, 80]、feature_lengths [B]
-输出：encoder_outputs、encoder_mask
+输出：encoder_outputs、encoder_lengths、encoder_mask
 ```
 
-当前官方 `ConformerEncoder.forward()` 返回 `(encoder_outputs, encoder_lengths, encoder_mask)`，但 FireRedLID Decoder 只消费 `encoder_outputs` 和 `encoder_mask`。为了保持官方三返回值接口兼容，Python adapter 按需通过 `encoder_mask.sum(dim=-1).squeeze(1)` 派生 `encoder_lengths`；TensorRT engine 本身不输出冗余的 lengths Tensor。
+三种后端都保持官方 `ConformerEncoder.forward()` 的原生三返回值接口。当前 FireRedLID Decoder 只消费 `encoder_outputs` 和 `encoder_mask`，但 `encoder_lengths` 仍作为后端契约的独立输出保留，便于与 eager 基线直接比较，也避免改变官方 Encoder 边界。
 
 三个实现分别为：
 
@@ -184,7 +184,7 @@ feature_dim = 80
 - 将 `padding_position_is_0()` 中逐样本 Python 循环改成 `arange` 与广播比较。
 - 删除 Encoder forward 中未被返回或消费的 `enc_outputs` Python 列表。
 - 保持 mask 的形状、有效位语义和 `uint8` dtype 与现有 Decoder 契约一致。
-- TensorRT 导出 wrapper 只暴露 `encoder_outputs` 和 `encoder_mask`；兼容 adapter 从 mask 派生 `encoder_lengths`。
+- TensorRT 导出 wrapper 保持 `encoder_outputs`、`encoder_lengths` 和 `encoder_mask` 三个原生输出。
 - 仅当导出测试提供具体失败证据时，才改写原地操作或不支持算子。
 - 不重写 Attention 数学公式，不替换激活、归一化、卷积或位置编码。
 
@@ -254,7 +254,7 @@ profiles.yaml
 - 比较等价改写前后的 eager FP32 Encoder。
 - 比较 ONNX Runtime FP32 与 eager FP32。
 - ONNX Runtime 的 `encoder_mask` 必须与 eager 基线逐元素一致。
-- adapter 从 mask 派生的 `encoder_lengths` 必须与 eager Encoder 返回的 lengths 完全一致。
+- ONNX Runtime 的 `encoder_lengths` 必须与 eager Encoder 返回的 lengths 逐元素一致。
 - FP32 `encoder_outputs` 使用 `rtol=1e-3, atol=1e-4`。
 - 覆盖 1、5、15、30、60 秒以及至少两个 batch size。
 - 覆盖逻辑 batch 拆分、顺序恢复、截断和三个 batch strategy。
@@ -265,7 +265,7 @@ profiles.yaml
 - 最终语言标签必须与 eager FP16 一致。
 - confidence 绝对误差不超过 `5e-3`。
 - TensorRT 的 `encoder_mask` 必须与 eager FP16 基线逐元素一致。
-- adapter 从 mask 派生的 `encoder_lengths` 必须与 eager Encoder 返回的 lengths 完全一致。
+- TensorRT 的 `encoder_lengths` 必须与 eager FP16 Encoder 返回的 lengths 逐元素一致。
 - FP16 `encoder_outputs` 使用 `rtol=2e-2, atol=2e-2`。
 - 任何标签不一致都视为失败并单独分析，不用整体准确率掩盖。
 
