@@ -5,7 +5,7 @@ transformers==4.51.3
 numpy==1.26.1
 cn2an==0.5.23
 kaldiio==2.18.0
-kaldi_native_fbank==1.15
+kaldi_native_fbank @ git+https://github.com/csukuangfj/kaldi-native-fbank.git@f68c6b43f739697d7ab02ff6debacee130e1d541
 sentencepiece==0.1.99
 soundfile==0.12.1
 textgrid

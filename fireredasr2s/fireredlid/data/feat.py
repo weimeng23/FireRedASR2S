@@ -8,6 +8,8 @@ import kaldi_native_fbank as knf
 import numpy as np
 import torch
 
+from ..runtime.batch_planner import FeatureItem, pad_features
+
 
 class FeatExtractor:
     def __init__(self, kaldi_cmvn_file):
@@ -15,47 +17,64 @@ class FeatExtractor:
         self.fbank = KaldifeatFbank(num_mel_bins=80, frame_length=25,
             frame_shift=10, dither=0.0)
 
-    def __call__(self, wav_paths, wav_uttids):
-        feats = []
-        durs = []
-        return_wav_paths = []
-        return_wav_uttids = []
+    def _load_waveform(self, wav_input):
+        if isinstance(wav_input, str):
+            return kaldiio.load_mat(wav_input)
+        sample_rate, wav_np = wav_input
+        return sample_rate, wav_np
 
-        wav_datas = []
-        if isinstance(wav_paths[0], str):
-            for wav_path in wav_paths:
-                sample_rate, wav_np = kaldiio.load_mat(wav_path)
-                wav_datas.append([sample_rate, wav_np])
-        else:
-            wav_datas = wav_paths
-
-        for (sample_rate, wav_np), path, uttid in zip(wav_datas, wav_paths, wav_uttids):
-            dur = wav_np.shape[0] / sample_rate
-            fbank = self.fbank((sample_rate, wav_np))
+    def extract_many(
+        self, wav_inputs, wav_uttids, max_audio_seconds=None
+    ):
+        items = []
+        for index, (wav_input, uttid) in enumerate(
+            zip(wav_inputs, wav_uttids)
+        ):
+            sample_rate, wav_np = self._load_waveform(wav_input)
+            duration_s = wav_np.shape[0] / sample_rate
+            max_samples = wav_np.shape[0]
+            if max_audio_seconds is not None:
+                max_samples = min(
+                    max_samples, int(sample_rate * max_audio_seconds)
+                )
+            processed_wav = wav_np[:max_samples]
+            processed_duration_s = processed_wav.shape[0] / sample_rate
+            fbank = self.fbank((sample_rate, processed_wav))
             if fbank.shape[0] < 1:
                 continue
             if self.cmvn is not None:
                 fbank = self.cmvn(fbank)
-            fbank = torch.from_numpy(fbank).float()
-            feats.append(fbank)
-            durs.append(dur)
-            return_wav_paths.append(path)
-            return_wav_uttids.append(uttid)
-        if len(feats) > 0:
-            lengths = torch.tensor([feat.size(0) for feat in feats]).long()
-            feats_pad = self.pad_feat(feats, 0.0)
-        else:
-            lengths, feats_pad = None, None
-        return feats_pad, lengths, durs, return_wav_paths, return_wav_uttids
+            items.append(
+                FeatureItem(
+                    index=index,
+                    uttid=uttid,
+                    wav_input=wav_input,
+                    feature=torch.from_numpy(fbank).float(),
+                    duration_s=duration_s,
+                    processed_duration_s=processed_duration_s,
+                    truncated=processed_wav.shape[0] != wav_np.shape[0],
+                )
+            )
+        return items
+
+    def __call__(self, wav_paths, wav_uttids):
+        items = self.extract_many(wav_paths, wav_uttids)
+        if not items:
+            return None, None, [], [], []
+        features = pad_features([item.feature for item in items])
+        lengths = torch.tensor(
+            [item.feature.size(0) for item in items], dtype=torch.long
+        )
+        return (
+            features,
+            lengths,
+            [item.duration_s for item in items],
+            [item.wav_input for item in items],
+            [item.uttid for item in items],
+        )
 
     def pad_feat(self, xs, pad_value):
-        # type: (List[Tensor], int) -> Tensor
-        n_batch = len(xs)
-        max_len = max([xs[i].size(0) for i in range(n_batch)])
-        pad = torch.ones(n_batch, max_len, *xs[0].size()[1:]).to(xs[0].device).to(xs[0].dtype).fill_(pad_value)
-        for i in range(n_batch):
-            pad[i, :xs[i].size(0)] = xs[i]
-        return pad
+        return pad_features(xs, pad_value)
 
 
 class CMVN:

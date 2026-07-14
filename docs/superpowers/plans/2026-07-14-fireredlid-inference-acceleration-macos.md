@@ -30,6 +30,7 @@ This plan implements design Phase A on macOS. It writes the Linux TensorRT build
 
 - `.gitignore`: keep generated runtime artifacts out of commits.
 - `pyproject.toml`: declare the missing official FBank dependency.
+- `requirements.txt`: replace the unavailable PyPI 1.15 pin with the exact official v1.15 commit.
 - `fireredasr2s/fireredlid/data/feat.py`: expose per-utterance extraction and 60-second truncation while preserving the legacy call.
 - `fireredasr2s/fireredlid/lid.py`: extend config, select backends, execute planned physical batches, and preserve result ordering.
 - `fireredasr2s/fireredlid/models/fireredlid_aed.py`: add opt-in benchmark timing hooks around Encoder and Decoder without changing default inference.
@@ -363,6 +364,7 @@ git commit -m "feat(fireredlid): add physical batch planner"
 
 **Files:**
 - Modify: `pyproject.toml`
+- Modify: `requirements.txt`
 - Modify: `fireredasr2s/fireredlid/data/feat.py:12-58`
 - Test: `tests/fireredlid/test_feat.py`
 
@@ -375,10 +377,12 @@ git commit -m "feat(fireredlid): add physical batch planner"
 Add this dependency to `pyproject.toml` next to `kaldiio`:
 
 ```toml
-"kaldi-native-fbank==1.15",
+"kaldi-native-fbank @ git+https://github.com/csukuangfj/kaldi-native-fbank.git@f68c6b43f739697d7ab02ff6debacee130e1d541",
 ```
 
-Run: `python3 -m pip install "kaldi-native-fbank==1.15"`
+Use the same direct reference in `requirements.txt`, then run:
+
+`python3 -m pip install "git+https://github.com/csukuangfj/kaldi-native-fbank.git@f68c6b43f739697d7ab02ff6debacee130e1d541"`
 
 Expected: installation succeeds and `python3 -c "import kaldi_native_fbank"` exits `0`.
 
@@ -506,7 +510,7 @@ Expected: exit code `0`.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add pyproject.toml fireredasr2s/fireredlid/data/feat.py tests/fireredlid/test_feat.py
+git add pyproject.toml requirements.txt fireredasr2s/fireredlid/data/feat.py tests/fireredlid/test_feat.py docs/superpowers/plans/2026-07-14-fireredlid-inference-acceleration-macos.md
 git commit -m "refactor(fireredlid): separate feature extraction from padding"
 ```
 
@@ -1398,7 +1402,7 @@ Expected: `2 passed`.
 The README must contain these Mac commands:
 
 ```bash
-python3 -m pip install "kaldi-native-fbank==1.15"
+python3 -m pip install "git+https://github.com/csukuangfj/kaldi-native-fbank.git@f68c6b43f739697d7ab02ff6debacee130e1d541"
 python3 -m pytest tests/fireredlid -v
 python3 runtime/fireredlid/export_encoder_onnx.py --model-dir FireRedLID --output-dir runtime/fireredlid/artifacts
 python3 runtime/fireredlid/verify.py --model-dir FireRedLID --onnx runtime/fireredlid/artifacts/encoder.fp32.onnx

@@ -16,6 +16,7 @@ dependencies = [
     "numpy==2.4.2",
     "cn2an==0.5.23",
     "kaldiio==2.18.1",
+    "kaldi-native-fbank @ git+https://github.com/csukuangfj/kaldi-native-fbank.git@f68c6b43f739697d7ab02ff6debacee130e1d541",
     "sentencepiece==0.2.1",
     "soundfile==0.13.1",
     "textgrid==1.6.1",
