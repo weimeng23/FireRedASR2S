@@ -786,6 +786,12 @@ class FireRedLidConfig:
     max_sub_batch_size: int | None = None
     fallback_backend: str | None = None
     return_diagnostics: bool = False
+    beam_size: int = field(init=False, default=3)
+    nbest: int = field(init=False, default=1)
+    decode_max_len: int = field(init=False, default=2)
+    softmax_smoothing: float = field(init=False, default=1.25)
+    aed_length_penalty: float = field(init=False, default=0.6)
+    eos_penalty: float = field(init=False, default=1.0)
 
     def __post_init__(self):
         if self.backend not in {"eager", "compile", "tensorrt"}:
@@ -860,7 +866,7 @@ def _infer_items(self, items):
         max_sub_batch_size=max_batch,
     )
     raw_results = {}
-    start_time = time.time()
+    inference_elapsed = 0.0
     for planned in planner.plan(items):
         features = planned.padded_features
         lengths = planned.feature_lengths
@@ -869,6 +875,7 @@ def _infer_items(self, items):
             lengths = lengths.cuda()
             if self.config.use_half:
                 features = features.half()
+        start_time = time.time()
         hypotheses = self.model.process(
             features,
             lengths,
@@ -879,6 +886,7 @@ def _infer_items(self, items):
             self.config.aed_length_penalty,
             self.config.eos_penalty,
         )
+        inference_elapsed += time.time() - start_time
         for item, hypotheses_for_item in zip(planned.items, hypotheses):
             hypothesis = hypotheses_for_item[0]
             ids = [int(token_id) for token_id in hypothesis["yseq"].cpu()]
@@ -897,9 +905,8 @@ def _infer_items(self, items):
                     "processed_dur_s": round(item.processed_duration_s, 3),
                 })
             raw_results[item.index] = result
-    elapsed = time.time() - start_time
     total_duration = sum(item.duration_s for item in items)
-    rtf = elapsed / total_duration if total_duration else 0.0
+    rtf = inference_elapsed / total_duration if total_duration else 0.0
     ordered = []
     for item in sorted(items, key=lambda value: value.index):
         result = raw_results[item.index]
@@ -914,7 +921,7 @@ Update `process()` to call `extract_many(..., max_audio_seconds=config.max_audio
 
 Run: `python3 -m pytest tests/fireredlid/test_lid_runtime.py tests/fireredlid/test_feat.py tests/fireredlid/test_batch_planner.py tests/fireredlid/test_encoder_backend.py -v`
 
-Expected: `12 passed`.
+Expected: `13 passed`.
 
 - [ ] **Step 7: Commit**
 
