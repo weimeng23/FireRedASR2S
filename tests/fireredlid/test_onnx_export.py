@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import onnxruntime as ort
@@ -97,6 +98,34 @@ def test_verify_onnx_outputs_checks_all_three_outputs(tmp_path):
         session,
         torch.ones(2, 7, 80),
         torch.tensor([5, 7]),
+    )
+
+    assert report["max_abs_error"] == 0.0
+
+
+def test_verify_backend_outputs_checks_all_three_outputs():
+    verify_module = load_verify_module()
+    encoder = TinyEncoder().eval()
+    features = torch.ones(2, 7, 80)
+    lengths = torch.tensor([5, 7])
+
+    class Backend:
+        def encode(self, input_features, input_lengths):
+            outputs, output_lengths, mask = encoder(
+                input_features,
+                input_lengths,
+            )
+            return SimpleNamespace(
+                outputs=outputs,
+                lengths=output_lengths,
+                mask=mask,
+            )
+
+    report = verify_module.verify_backend_outputs(
+        encoder,
+        Backend(),
+        features,
+        lengths,
     )
 
     assert report["max_abs_error"] == 0.0

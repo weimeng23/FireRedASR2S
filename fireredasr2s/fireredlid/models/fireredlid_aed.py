@@ -1,5 +1,7 @@
 # Copyright 2026 Xiaohongshu. (Author: Kaituo Xu, Yan Jia)
 
+from contextlib import nullcontext
+
 import torch
 
 from .module.conformer_encoder import ConformerEncoder
@@ -28,10 +30,24 @@ class FireRedLidAed(torch.nn.Module):
 
     def process(self, padded_input, input_lengths,
                 beam_size=3, nbest=1, decode_max_len=2,
-                softmax_smoothing=1.25, length_penalty=0.6, eos_penalty=1.0):
-        enc_outputs, enc_lengths, enc_mask = self.encoder(padded_input, input_lengths)
-        nbest_hyps = self.lid_decoder.batch_beam_search(
-            enc_outputs, enc_mask,
-            beam_size, nbest, decode_max_len,
-            softmax_smoothing, length_penalty, eos_penalty)
+                softmax_smoothing=1.25, length_penalty=0.6, eos_penalty=1.0,
+                stage_recorder=None):
+        encoder_stage = (
+            stage_recorder.measure("encoder")
+            if stage_recorder is not None
+            else nullcontext()
+        )
+        with encoder_stage:
+            enc_outputs, enc_lengths, enc_mask = self.encoder(
+                padded_input, input_lengths)
+        decoder_stage = (
+            stage_recorder.measure("decoder")
+            if stage_recorder is not None
+            else nullcontext()
+        )
+        with decoder_stage:
+            nbest_hyps = self.lid_decoder.batch_beam_search(
+                enc_outputs, enc_mask,
+                beam_size, nbest, decode_max_len,
+                softmax_smoothing, length_penalty, eos_penalty)
         return nbest_hyps

@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -16,7 +17,7 @@ class FakeModel:
     def __init__(self):
         self.batch_sizes = []
 
-    def process(self, features, lengths, *args):
+    def process(self, features, lengths, *args, stage_recorder=None):
         self.batch_sizes.append(features.size(0))
         return [
             [
@@ -29,6 +30,16 @@ class FakeModel:
             ]
             for index in range(features.size(0))
         ]
+
+
+class RecordingStageRecorder:
+    def __init__(self):
+        self.names = []
+
+    @contextmanager
+    def measure(self, name):
+        self.names.append(name)
+        yield
 
 
 def item(index, value, duration):
@@ -155,3 +166,31 @@ def test_engine_max_batch_is_a_hard_upper_bound():
     )
 
     assert lid.model.batch_sizes == [1, 1, 1]
+
+
+def test_infer_items_records_transfer_and_result_formatting_stages():
+    lid = make_lid(FireRedLidConfig(use_gpu=False))
+    recorder = RecordingStageRecorder()
+    lid.stage_recorder = recorder
+
+    lid._infer_items([item(0, 1, 1)])
+
+    assert "h2d" in recorder.names
+    assert "result_formatting" in recorder.names
+
+
+def test_process_records_fbank_stage_for_empty_features():
+    class EmptyFeatureExtractor:
+        def extract_many(self, *args, **kwargs):
+            return []
+
+    lid = FireRedLid.__new__(FireRedLid)
+    lid.config = FireRedLidConfig(use_gpu=False)
+    lid.feat_extractor = EmptyFeatureExtractor()
+    recorder = RecordingStageRecorder()
+    lid.stage_recorder = recorder
+
+    result = lid.process(["empty"], ["empty.wav"])
+
+    assert result == [{"uttid": "empty", "lang": ""}]
+    assert recorder.names == ["fbank"]

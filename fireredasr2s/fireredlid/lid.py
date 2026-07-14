@@ -5,6 +5,7 @@ import os
 import re
 import time
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 import torch
@@ -97,6 +98,7 @@ class FireRedLid:
         self.tokenizer = tokenizer
         self.config = config
         self.model_path = model_path
+        self.stage_recorder = None
         self._configure_encoder_backend()
         if self.config.use_gpu:
             if self.config.use_half:
@@ -139,6 +141,12 @@ class FireRedLid:
         self.model.encoder = CompatibleEncoderAdapter(backend)
         self.active_backend = self.config.backend
 
+    def _measure_stage(self, name):
+        recorder = getattr(self, "stage_recorder", None)
+        if recorder is None:
+            return nullcontext()
+        return recorder.measure(name)
+
     def _infer_items(self, items):
         limits = [
             value
@@ -156,15 +164,16 @@ class FireRedLid:
         raw_results = {}
         inference_elapsed = 0.0
         for planned in planner.plan(items):
-            features = planned.padded_features
-            lengths = planned.feature_lengths
-            if self.config.use_gpu:
-                features = features.cuda()
-                lengths = lengths.cuda()
-                if self.config.use_half:
-                    features = features.half()
+            with self._measure_stage("h2d"):
+                features = planned.padded_features
+                lengths = planned.feature_lengths
+                if self.config.use_gpu:
+                    features = features.cuda()
+                    lengths = lengths.cuda()
+                    if self.config.use_half:
+                        features = features.half()
             start_time = time.time()
-            hypotheses = self.model.process(
+            process_args = (
                 features,
                 lengths,
                 self.config.beam_size,
@@ -174,36 +183,45 @@ class FireRedLid:
                 self.config.aed_length_penalty,
                 self.config.eos_penalty,
             )
+            recorder = getattr(self, "stage_recorder", None)
+            if recorder is None:
+                hypotheses = self.model.process(*process_args)
+            else:
+                hypotheses = self.model.process(
+                    *process_args,
+                    stage_recorder=recorder,
+                )
             inference_elapsed += time.time() - start_time
-            for item, hypotheses_for_item in zip(
-                planned.items, hypotheses
-            ):
-                hypothesis = hypotheses_for_item[0]
-                ids = [
-                    int(token_id)
-                    for token_id in hypothesis["yseq"].cpu()
-                ]
-                result = {
-                    "uttid": item.uttid,
-                    "lang": self.tokenizer.detokenize(ids),
-                    "confidence": round(
-                        hypothesis["confidence"].cpu().item(), 3
-                    ),
-                    "dur_s": round(item.duration_s, 3),
-                }
-                if isinstance(item.wav_input, str):
-                    result["wav"] = item.wav_input
-                if self.config.return_diagnostics:
-                    result.update(
-                        {
-                            "backend": self.active_backend,
-                            "truncated": item.truncated,
-                            "processed_dur_s": round(
-                                item.processed_duration_s, 3
-                            ),
-                        }
-                    )
-                raw_results[item.index] = result
+            with self._measure_stage("result_formatting"):
+                for item, hypotheses_for_item in zip(
+                    planned.items, hypotheses
+                ):
+                    hypothesis = hypotheses_for_item[0]
+                    ids = [
+                        int(token_id)
+                        for token_id in hypothesis["yseq"].cpu()
+                    ]
+                    result = {
+                        "uttid": item.uttid,
+                        "lang": self.tokenizer.detokenize(ids),
+                        "confidence": round(
+                            hypothesis["confidence"].cpu().item(), 3
+                        ),
+                        "dur_s": round(item.duration_s, 3),
+                    }
+                    if isinstance(item.wav_input, str):
+                        result["wav"] = item.wav_input
+                    if self.config.return_diagnostics:
+                        result.update(
+                            {
+                                "backend": self.active_backend,
+                                "truncated": item.truncated,
+                                "processed_dur_s": round(
+                                    item.processed_duration_s, 3
+                                ),
+                            }
+                        )
+                    raw_results[item.index] = result
         total_duration = sum(item.duration_s for item in items)
         rtf = (
             inference_elapsed / total_duration
@@ -221,11 +239,12 @@ class FireRedLid:
     def process(self, batch_uttid, batch_wav_path):
         batch_uttid_origin = batch_uttid
         try:
-            items = self.feat_extractor.extract_many(
-                batch_wav_path,
-                batch_uttid,
-                max_audio_seconds=self.config.max_audio_seconds,
-            )
+            with self._measure_stage("fbank"):
+                items = self.feat_extractor.extract_many(
+                    batch_wav_path,
+                    batch_uttid,
+                    max_audio_seconds=self.config.max_audio_seconds,
+                )
             if not items:
                 return [
                     {"uttid": uttid, "lang": ""}

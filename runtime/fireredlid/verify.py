@@ -6,7 +6,6 @@ import sys
 import time
 from pathlib import Path
 
-import onnxruntime as ort
 import torch
 
 
@@ -40,28 +39,83 @@ def verify_onnx_outputs(
     actual_outputs = torch.from_numpy(actual_outputs)
     actual_lengths = torch.from_numpy(actual_lengths)
     actual_mask = torch.from_numpy(actual_mask)
-    if not torch.equal(actual_mask, expected_mask.cpu()):
+    return _compare_outputs(
+        expected_outputs.cpu(),
+        expected_lengths.cpu(),
+        expected_mask.cpu(),
+        actual_outputs,
+        actual_lengths,
+        actual_mask,
+        rtol=rtol,
+        atol=atol,
+    )
+
+
+def _compare_outputs(
+    expected_outputs,
+    expected_lengths,
+    expected_mask,
+    actual_outputs,
+    actual_lengths,
+    actual_mask,
+    rtol,
+    atol,
+):
+    if not torch.equal(actual_mask, expected_mask):
         raise AssertionError("encoder_mask differs from eager baseline")
-    if not torch.equal(actual_lengths, expected_lengths.cpu()):
+    if not torch.equal(actual_lengths, expected_lengths):
         raise AssertionError("encoder_lengths differs from eager baseline")
     torch.testing.assert_close(
         actual_outputs,
-        expected_outputs.cpu(),
+        expected_outputs,
         rtol=rtol,
         atol=atol,
     )
     max_abs_error = float(
-        (actual_outputs - expected_outputs.cpu()).abs().max().item()
+        (actual_outputs - expected_outputs).abs().max().item()
     )
     return {"max_abs_error": max_abs_error}
 
 
+def verify_backend_outputs(
+    encoder,
+    backend,
+    features,
+    lengths,
+    rtol=1e-2,
+    atol=1e-2,
+):
+    with torch.inference_mode():
+        expected_outputs, expected_lengths, expected_mask = encoder(
+            features,
+            lengths,
+        )
+        actual = backend.encode(features, lengths)
+    return _compare_outputs(
+        expected_outputs,
+        expected_lengths,
+        expected_mask,
+        actual.outputs,
+        actual.lengths,
+        actual.mask,
+        rtol=rtol,
+        atol=atol,
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Compare dynamic FireRedLID Encoder ONNX against eager FP32."
+        description="Compare a FireRedLID Encoder backend against eager."
     )
     parser.add_argument("--model-dir", required=True)
-    parser.add_argument("--onnx", required=True)
+    parser.add_argument(
+        "--backend",
+        choices=["onnx", "tensorrt"],
+        default="onnx",
+    )
+    artifacts = parser.add_mutually_exclusive_group(required=True)
+    artifacts.add_argument("--onnx")
+    artifacts.add_argument("--engine-dir")
     parser.add_argument("--report")
     parser.add_argument(
         "--seconds",
@@ -75,19 +129,38 @@ def parse_args():
         nargs="+",
         default=[1, 2],
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.backend == "onnx" and not args.onnx:
+        parser.error("--backend onnx requires --onnx")
+    if args.backend == "tensorrt" and not args.engine_dir:
+        parser.error("--backend tensorrt requires --engine-dir")
+    return args
 
 
 def main():
     args = parse_args()
-    model = load_fireredlid_model(
-        Path(args.model_dir) / "model.pth.tar"
-    )
-    encoder = model.encoder.float().cpu().eval()
-    session = ort.InferenceSession(
-        args.onnx,
-        providers=["CPUExecutionProvider"],
-    )
+    checkpoint_path = Path(args.model_dir) / "model.pth.tar"
+    model = load_fireredlid_model(checkpoint_path)
+    if args.backend == "onnx":
+        import onnxruntime as ort
+
+        encoder = model.encoder.float().cpu().eval()
+        session = ort.InferenceSession(
+            args.onnx,
+            providers=["CPUExecutionProvider"],
+        )
+        backend = None
+    else:
+        from fireredasr2s.fireredlid.runtime.tensorrt_backend import (
+            TensorRTEncoderBackend,
+        )
+
+        encoder = model.encoder.half().cuda().eval()
+        session = None
+        backend = TensorRTEncoderBackend(
+            args.engine_dir,
+            checkpoint_path=checkpoint_path,
+        )
     torch.manual_seed(0)
     cases = []
     failed = False
@@ -102,14 +175,25 @@ def main():
             )
             if batch_size > 1:
                 lengths[-1] = max(1, frames - 37)
+            if args.backend == "tensorrt":
+                features = features.half().cuda()
+                lengths = lengths.cuda()
             started = time.perf_counter()
             try:
-                metrics = verify_onnx_outputs(
-                    encoder,
-                    session,
-                    features,
-                    lengths,
-                )
+                if args.backend == "onnx":
+                    metrics = verify_onnx_outputs(
+                        encoder,
+                        session,
+                        features,
+                        lengths,
+                    )
+                else:
+                    metrics = verify_backend_outputs(
+                        encoder,
+                        backend,
+                        features,
+                        lengths,
+                    )
                 cases.append(
                     {
                         "seconds": seconds,
@@ -135,7 +219,11 @@ def main():
     report_path = (
         Path(args.report)
         if args.report
-        else Path(args.onnx).with_name("verify.fp32.json")
+        else (
+            Path(args.onnx).with_name("verify.fp32.json")
+            if args.backend == "onnx"
+            else Path(args.engine_dir) / "verify.fp16.json"
+        )
     )
     report_path.write_text(
         json.dumps({"cases": cases}, indent=2),
