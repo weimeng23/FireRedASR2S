@@ -29,7 +29,15 @@ PROFILE_WORKLOADS = {
 }
 
 
+def _validate_unique_selectors(args):
+    for name in ("backends", "scopes"):
+        values = getattr(args, name)
+        if len(values) != len(set(values)):
+            raise ValueError(f"--{name} must not contain duplicates")
+
+
 def build_commands(args) -> list[list[str]]:
+    _validate_unique_selectors(args)
     if "tensorrt" in args.backends and not args.engine_dir:
         raise ValueError("TensorRT matrix requires --engine-dir")
 
@@ -167,6 +175,10 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
+    try:
+        _validate_unique_selectors(args)
+    except ValueError as error:
+        parser.error(str(error))
     if "tensorrt" in args.backends and not args.engine_dir:
         parser.error("TensorRT in --backends requires --engine-dir")
     return args

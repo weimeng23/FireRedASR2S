@@ -92,7 +92,7 @@ config = FireRedLidConfig(
     use_gpu=True,
     use_half=True,
     backend="tensorrt",
-    engine_dir="runtime/fireredlid/artifacts/engine",
+    engine_dir="runtime/fireredlid/artifacts/rtx-pro-5000/engine",
     profile="latency",
     batch_strategy="none",
     max_audio_seconds=60.0,
@@ -106,7 +106,7 @@ python3 runtime/fireredlid/benchmark.py \
   --model-dir FireRedLID \
   --manifest runtime/fireredlid/example_manifest.jsonl \
   --backend tensorrt \
-  --engine-dir runtime/fireredlid/artifacts/engine \
+  --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine \
   --device cuda \
   --precision fp16 \
   --profile latency \
@@ -135,7 +135,7 @@ config = FireRedLidConfig(
     use_gpu=True,
     use_half=True,
     backend="tensorrt",
-    engine_dir="runtime/fireredlid/artifacts/engine",
+    engine_dir="runtime/fireredlid/artifacts/rtx-pro-5000/engine",
     profile="throughput",
     batch_strategy="auto",
     max_audio_seconds=60.0,
@@ -149,7 +149,7 @@ python3 runtime/fireredlid/benchmark.py \
   --model-dir FireRedLID \
   --manifest /path/to/benchmark.jsonl \
   --backend tensorrt \
-  --engine-dir runtime/fireredlid/artifacts/engine \
+  --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine \
   --device cuda \
   --precision fp16 \
   --profile throughput \
@@ -169,20 +169,21 @@ apply.
 ## Linux NVIDIA handoff
 
 Copy the complete ONNX artifact directory, the model checkpoint, and this
-repository to the target RTX PRO 5000 or L20 host. Build the FP16 engine on the
-same GPU class and TensorRT/CUDA software stack used for deployment:
+repository to the target RTX PRO 5000 or L20 host. Keep one engine directory
+per GPU class and TensorRT/CUDA software stack. The commands below build and
+verify the RTX PRO 5000 engine in its dedicated directory:
 
 ```bash
 python3 runtime/fireredlid/build_engine.py \
   --onnx runtime/fireredlid/artifacts/torch2.10-opset17-fp32/encoder.fp32.onnx \
   --checkpoint FireRedLID/model.pth.tar \
   --profiles runtime/fireredlid/profiles.yaml \
-  --output-dir runtime/fireredlid/artifacts/engine
+  --output-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine
 
 python3 runtime/fireredlid/verify.py \
   --model-dir FireRedLID \
   --backend tensorrt \
-  --engine-dir runtime/fireredlid/artifacts/engine
+  --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine
 ```
 
 ```bash
@@ -190,9 +191,9 @@ uv run python runtime/fireredlid/verify_labels.py \
   --model-dir FireRedLID \
   --manifest /path/to/representative-lid.jsonl \
   --candidate-backend tensorrt \
-  --engine-dir runtime/fireredlid/artifacts/engine \
+  --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine \
   --confidence-atol 0.005 \
-  --report runtime/fireredlid/artifacts/engine/verify.labels.json
+  --report runtime/fireredlid/artifacts/rtx-pro-5000/engine/verify.labels.json
 ```
 
 The engine directory contains:
@@ -215,7 +216,7 @@ report names are not overwritten. For example, run latency on RTX PRO 5000:
 uv run python runtime/fireredlid/run_benchmark_matrix.py \
   --model-dir FireRedLID \
   --manifest /path/to/representative-latency.jsonl \
-  --engine-dir runtime/fireredlid/artifacts/engine \
+  --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine \
   --profile latency \
   --output-dir runtime/fireredlid/artifacts/rtx-pro-5000/latency \
   --execute
@@ -228,18 +229,20 @@ different directory:
 uv run python runtime/fireredlid/run_benchmark_matrix.py \
   --model-dir FireRedLID \
   --manifest /path/to/representative-throughput.jsonl \
-  --engine-dir runtime/fireredlid/artifacts/engine \
+  --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine \
   --profile throughput \
   --output-dir runtime/fireredlid/artifacts/rtx-pro-5000/throughput \
   --execute
 ```
 
-Repeat both commands on L20 with an engine built on that GPU and output paths
-under `artifacts/l20/`. Each invocation runs eager, compile, and TensorRT for
-the `encoder`, `model`, and `end-to-end` scopes. Latency fixes logical batch
-size 1, no bucketing, five warm-ups, and 50 measured iterations. Throughput
-fixes logical batch size 100, automatic batching, three warm-ups, and 20
-measured iterations.
+Repeat the build, verification, latency, and throughput commands on L20 with
+`--engine-dir runtime/fireredlid/artifacts/l20/engine` (and the matching build
+`--output-dir`). Keep its reports under `artifacts/l20/latency` and
+`artifacts/l20/throughput`. Each matrix invocation runs eager, compile, and
+TensorRT for the `encoder`, `model`, and `end-to-end` scopes. Latency fixes
+logical batch size 1, no bucketing, five warm-ups, and 50 measured iterations.
+Throughput fixes logical batch size 100, automatic batching, three warm-ups,
+and 20 measured iterations.
 
 Without `--execute`, the runner only prints nine shell-escaped commands. The
 default matrix includes TensorRT, so `--engine-dir` is still required for a

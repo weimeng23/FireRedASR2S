@@ -129,11 +129,33 @@ def test_command_order_and_output_names_are_deterministic(tmp_path):
     second = module.build_commands(args)
 
     assert first == second
-    assert [option_value(command, "--output") for command in first] == [
+    outputs = [option_value(command, "--output") for command in first]
+    assert outputs == [
         str(tmp_path / f"benchmark.{backend}.latency.{scope}.json")
         for backend in ["eager", "compile", "tensorrt"]
         for scope in ["encoder", "model", "end-to-end"]
     ]
+    assert len(outputs) == len(set(outputs))
+
+
+@pytest.mark.parametrize(
+    ("selector", "values"),
+    [
+        ("backends", ["eager", "eager"]),
+        ("scopes", ["encoder", "encoder"]),
+    ],
+)
+def test_build_commands_rejects_duplicate_selectors(
+    tmp_path,
+    selector,
+    values,
+):
+    module = load_benchmark_matrix_module()
+
+    with pytest.raises(ValueError, match=f"--{selector}"):
+        module.build_commands(
+            make_args(output_dir=tmp_path, **{selector: values})
+        )
 
 
 def test_tensorrt_commands_always_include_engine_dir(tmp_path):
@@ -218,6 +240,43 @@ def test_dry_run_allows_missing_paths_and_never_launches_subprocess(
         output_dir / "benchmark.eager.latency.encoder.json"
     )
     assert not output_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--backends", "eager"),
+        ("--scopes", "encoder"),
+    ],
+)
+def test_cli_rejects_duplicate_selectors_before_execute_side_effects(
+    tmp_path,
+    monkeypatch,
+    option,
+    value,
+):
+    module = load_benchmark_matrix_module()
+    calls = []
+
+    def fake_run(command, check):
+        calls.append((command, check))
+        return subprocess.CompletedProcess(command, 0)
+
+    replace_subprocess_run(module, monkeypatch, fake_run)
+    argv = execution_argv(
+        tmp_path,
+        option,
+        value,
+        value,
+        "--execute",
+    )
+
+    with pytest.raises(SystemExit) as error:
+        module.main(argv)
+
+    assert error.value.code == 2
+    assert calls == []
+    assert not (tmp_path / "matrix").exists()
 
 
 @pytest.mark.parametrize("missing", ["model", "manifest", "engine"])

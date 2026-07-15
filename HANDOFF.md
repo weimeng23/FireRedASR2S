@@ -38,13 +38,17 @@ class.
 
 ## Repository state
 
-Current branch and implementation base after the ONNX-layout follow-up:
+Historical Phase A snapshot after the ONNX-layout follow-up (not the current
+Phase B HEAD):
 
 ```text
 branch: lid-infer-accel
-HEAD:   aaf9d86
-remote: origin/lid-infer-accel (synchronized)
+historical Phase A base: aaf9d86
+remote at that snapshot: origin/lid-infer-accel (synchronized)
 ```
+
+Run `git rev-parse --short HEAD` in the live checkout to identify the current
+Phase B head; do not infer it from this historical snapshot block.
 
 Committed feature stack, newest first:
 
@@ -118,7 +122,7 @@ Important details:
    audio-seconds/s, RTF, padding ratio, physical shapes and peak CUDA memory.
 10. Latency and throughput example configurations and the Linux handoff are
     documented in `runtime/fireredlid/README.md`.
-11. The 99-test FireRedLID unit/contract suite covers the mask, feature
+11. The 103-test FireRedLID unit/contract suite covers the mask, feature
     truncation, planner, backend adapter, configuration, result ordering, ONNX
     export, verification, benchmark summary, TensorRT artifact validation, and
     benchmark orchestration.
@@ -256,7 +260,7 @@ batching, three warm-ups, and 20 measured iterations.
 This completion is limited to orchestration and Mac-testable contracts. No
 TensorRT engine, CUDA compile result, label-parity result, RTX PRO 5000/L20
 timing, or matrix index from a real Linux GPU run has been produced yet.
-Fresh Mac verification after Task 6 passed all 99 FireRedLID tests with the
+Fresh Mac verification after Task 6 passed all 103 FireRedLID tests with the
 four pre-existing legacy ONNX exporter warnings. The exact latency dry-run
 printed nine commands and created no output directory.
 
@@ -384,7 +388,9 @@ been reviewed.
 
 1. Use the same software stack intended for deployment.
 2. Build an engine separately on RTX PRO 5000 and L20; do not assume one plan
-   is portable or optimal across GPU classes.
+   is portable or optimal across GPU classes. Store them separately under
+   `runtime/fireredlid/artifacts/rtx-pro-5000/engine` and
+   `runtime/fireredlid/artifacts/l20/engine`.
 3. Start with the checked-in default profile:
 
    ```text
@@ -395,7 +401,7 @@ been reviewed.
 
 4. Verify engine hashes, input/output names, shape ranges and FP16 dtype.
 5. Compare TensorRT Encoder outputs to eager FP16. The current TensorRT verifier
-   uses `rtol=1e-2`, `atol=1e-2`; lengths and masks must remain exact.
+   uses `rtol=2e-2`, `atol=2e-2`; lengths and masks must remain exact.
 6. Compare final labels and confidence against eager FP16 on a representative
    dataset, not only two sample files.
 7. Confirm logical batches larger than engine max batch are split and restored
@@ -447,8 +453,9 @@ git rev-parse --short HEAD
 git status --short
 ```
 
-Expected committed snapshot before the local Phase B work is branch
-`lid-infer-accel`, HEAD `aaf9d86`.
+The historical snapshot before local Phase B work is branch
+`lid-infer-accel` at `aaf9d86`. Treat the live output from
+`git rev-parse --short HEAD` above as the current Phase B head.
 
 ### Install and inspect the current UV environment
 
@@ -466,7 +473,7 @@ Runtime/contract tests:
 uv run python -m pytest tests/fireredlid -v
 ```
 
-Expected Phase B result: 99 passed with four legacy ONNX exporter warnings; no
+Expected Phase B result: 103 passed with four legacy ONNX exporter warnings; no
 `onnxscript` dependency is required. Re-run the complete suite after copying
 the Phase B commits rather than relying on the earlier 29-test Phase A
 snapshot.
@@ -559,12 +566,12 @@ uv run python runtime/fireredlid/build_engine.py \
   --onnx runtime/fireredlid/artifacts/torch2.10-opset17-fp32/encoder.fp32.onnx \
   --checkpoint FireRedLID/model.pth.tar \
   --profiles runtime/fireredlid/profiles.yaml \
-  --output-dir runtime/fireredlid/artifacts/engine
+  --output-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine
 
 uv run python runtime/fireredlid/verify.py \
   --model-dir FireRedLID \
   --backend tensorrt \
-  --engine-dir runtime/fireredlid/artifacts/engine
+  --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine
 ```
 
 The engine directory must contain:
@@ -584,7 +591,7 @@ backend/scope commands and executes them sequentially only with `--execute`:
 uv run python runtime/fireredlid/run_benchmark_matrix.py \
   --model-dir FireRedLID \
   --manifest /path/to/representative-latency.jsonl \
-  --engine-dir runtime/fireredlid/artifacts/engine \
+  --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine \
   --profile latency \
   --output-dir runtime/fireredlid/artifacts/rtx-pro-5000/latency \
   --execute
@@ -620,7 +627,7 @@ Compile substitution:
 TensorRT substitution:
 
 ```text
---backend tensorrt --engine-dir runtime/fireredlid/artifacts/engine
+--backend tensorrt --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine
 ```
 
 ### Linux offline-throughput benchmark matrix
@@ -633,7 +640,7 @@ from every other GPU:
 uv run python runtime/fireredlid/run_benchmark_matrix.py \
   --model-dir FireRedLID \
   --manifest /path/to/representative-throughput.jsonl \
-  --engine-dir runtime/fireredlid/artifacts/engine \
+  --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine \
   --profile throughput \
   --output-dir runtime/fireredlid/artifacts/rtx-pro-5000/throughput \
   --execute
@@ -647,7 +654,7 @@ for scope in encoder model end-to-end; do
     --model-dir FireRedLID \
     --manifest /path/to/representative-throughput.jsonl \
     --backend tensorrt \
-    --engine-dir runtime/fireredlid/artifacts/engine \
+    --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine \
     --device cuda \
     --precision fp16 \
     --profile throughput \
@@ -665,10 +672,12 @@ iteration settings. The logical batch may be 100 even when the engine physical
 maximum is 4; the planner splits it into physical sub-batches. Tune the engine
 maximum only after recording memory and latency/throughput on each target GPU.
 
-Repeat both matrix invocations on L20 using its own engine and output
-directories under `runtime/fireredlid/artifacts/l20/`. Each successful matrix
-writes nine benchmark JSON files and `matrix.index.json`. Return the index and
-reports for review; a Mac dry-run is command-generation evidence only.
+Repeat the build and both matrix invocations on L20 using
+`runtime/fireredlid/artifacts/l20/engine`, with report directories
+`runtime/fireredlid/artifacts/l20/latency` and
+`runtime/fireredlid/artifacts/l20/throughput`. Each successful matrix writes
+nine benchmark JSON files and `matrix.index.json`. Return the index and reports
+for review; a Mac dry-run is command-generation evidence only.
 
 ## Key cautions for the next agent
 
