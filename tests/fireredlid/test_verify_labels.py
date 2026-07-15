@@ -1,6 +1,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT = Path("runtime/fireredlid/verify_labels.py")
 
@@ -165,3 +167,26 @@ def test_compare_results_is_stable_across_input_order():
     assert report["passed"] is False
     assert report["label_mismatches"][0]["uttid"] == "b"
     assert report["confidence_mismatches"][0]["uttid"] == "a"
+
+
+@pytest.mark.parametrize("confidence_atol", ["nan", "inf"])
+def test_parse_args_rejects_non_finite_confidence_atol(confidence_atol):
+    module = load_verify_labels_module()
+
+    with pytest.raises(SystemExit) as error:
+        module.parse_args(
+            [
+                "--model-dir",
+                "FireRedLID",
+                "--manifest",
+                "manifest.jsonl",
+                "--candidate-backend",
+                "compile",
+                "--confidence-atol",
+                confidence_atol,
+                "--report",
+                "verify.labels.json",
+            ]
+        )
+
+    assert error.value.code == 2

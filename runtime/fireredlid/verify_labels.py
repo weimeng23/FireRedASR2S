@@ -3,6 +3,7 @@
 import argparse
 import gc
 import json
+import math
 import platform
 import subprocess
 import sys
@@ -270,8 +271,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.candidate_backend == "tensorrt" and not args.engine_dir:
         parser.error("--candidate-backend tensorrt requires --engine-dir")
-    if args.confidence_atol < 0:
-        parser.error("--confidence-atol must be non-negative")
+    if not math.isfinite(args.confidence_atol) or args.confidence_atol < 0:
+        parser.error("--confidence-atol must be finite and non-negative")
     return args
 
 
