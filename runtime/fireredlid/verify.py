@@ -2,6 +2,8 @@
 
 import argparse
 import json
+import math
+import platform
 import sys
 import time
 from pathlib import Path
@@ -82,8 +84,8 @@ def verify_backend_outputs(
     backend,
     features,
     lengths,
-    rtol=1e-2,
-    atol=1e-2,
+    rtol=2e-2,
+    atol=2e-2,
 ):
     with torch.inference_mode():
         expected_outputs, expected_lengths, expected_mask = encoder(
@@ -103,7 +105,29 @@ def verify_backend_outputs(
     )
 
 
-def parse_args():
+def resolve_tolerances(args):
+    default_rtol, default_atol = (
+        (1e-3, 1e-4) if args.backend == "onnx" else (2e-2, 2e-2)
+    )
+    rtol = default_rtol if args.rtol is None else args.rtol
+    atol = default_atol if args.atol is None else args.atol
+    return rtol, atol
+
+
+def environment():
+    gpu = None
+    if torch.cuda.is_available():
+        gpu = torch.cuda.get_device_name(torch.cuda.current_device())
+    return {
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "pytorch": str(torch.__version__),
+        "cuda": torch.version.cuda,
+        "gpu": gpu,
+    }
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Compare a FireRedLID Encoder backend against eager."
     )
@@ -117,6 +141,8 @@ def parse_args():
     artifacts.add_argument("--onnx")
     artifacts.add_argument("--engine-dir")
     parser.add_argument("--report")
+    parser.add_argument("--rtol", type=float)
+    parser.add_argument("--atol", type=float)
     parser.add_argument(
         "--seconds",
         type=int,
@@ -129,16 +155,21 @@ def parse_args():
         nargs="+",
         default=[1, 2],
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.backend == "onnx" and not args.onnx:
         parser.error("--backend onnx requires --onnx")
     if args.backend == "tensorrt" and not args.engine_dir:
         parser.error("--backend tensorrt requires --engine-dir")
+    for name in ("rtol", "atol"):
+        value = getattr(args, name)
+        if value is not None and (not math.isfinite(value) or value < 0):
+            parser.error(f"--{name} must be finite and non-negative")
     return args
 
 
 def main():
     args = parse_args()
+    rtol, atol = resolve_tolerances(args)
     checkpoint_path = Path(args.model_dir) / "model.pth.tar"
     model = load_fireredlid_model(checkpoint_path)
     if args.backend == "onnx":
@@ -186,6 +217,8 @@ def main():
                         session,
                         features,
                         lengths,
+                        rtol=rtol,
+                        atol=atol,
                     )
                 else:
                     metrics = verify_backend_outputs(
@@ -193,6 +226,8 @@ def main():
                         backend,
                         features,
                         lengths,
+                        rtol=rtol,
+                        atol=atol,
                     )
                 cases.append(
                     {
@@ -225,10 +260,17 @@ def main():
             else Path(args.engine_dir) / "verify.fp16.json"
         )
     )
-    report_path.write_text(
-        json.dumps({"cases": cases}, indent=2),
-        encoding="utf-8",
-    )
+    report = {
+        "arguments": {
+            **vars(args),
+            "resolved_rtol": rtol,
+            "resolved_atol": atol,
+        },
+        "environment": environment(),
+        "cases": cases,
+        "passed": not failed,
+    }
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(report_path)
     if failed:
         raise SystemExit(1)

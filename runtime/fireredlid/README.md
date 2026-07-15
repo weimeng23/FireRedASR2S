@@ -52,6 +52,14 @@ python3 runtime/fireredlid/verify.py \
   --report runtime/fireredlid/artifacts/torch2.10-opset17-fp32/verify.fp32.json
 ```
 
+Encoder verification uses backend-specific numerical tolerances: ONNX defaults
+to `--rtol 0.001 --atol 0.0001`, while TensorRT defaults to
+`--rtol 0.02 --atol 0.02`. Pass either option explicitly to override its
+backend default. The JSON report records both the CLI values and the resolved
+tolerances under `arguments`, along with top-level `environment`, `cases`, and
+`passed` fields. `passed` is false when any case fails; existing case-level
+timing, shape, status, and `max_abs_error` fields remain available.
+
 Generated artifacts are ignored by Git. A large exported model may use ONNX
 external-data files, so copy the complete artifact directory rather than only
 `encoder.fp32.onnx`. External weight files are stored under the artifact's
