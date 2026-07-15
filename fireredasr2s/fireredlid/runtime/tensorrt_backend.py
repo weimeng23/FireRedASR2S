@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,7 +64,10 @@ class EngineManifest:
             "engine_sha256",
         ):
             value = data.get(name)
-            if not isinstance(value, str) or len(value) != 64:
+            if (
+                not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            ):
                 raise ArtifactMismatchError(f"invalid {name}")
         expected_dtypes = {
             "features": "float16",

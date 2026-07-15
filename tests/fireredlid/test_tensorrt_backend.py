@@ -266,6 +266,19 @@ def test_manifest_requires_64_character_hashes(tmp_path, field):
 
 @pytest.mark.parametrize(
     "field",
+    ["checkpoint_sha256", "onnx_sha256", "engine_sha256"],
+)
+def test_manifest_requires_lowercase_hex_hashes(tmp_path, field):
+    data = manifest_data()
+    data[field] = "z" * 64
+    write_manifest(tmp_path / "manifest.json", data)
+
+    with pytest.raises(ArtifactMismatchError, match=f"invalid {field}"):
+        EngineManifest.load(tmp_path / "manifest.json")
+
+
+@pytest.mark.parametrize(
+    "field",
     [
         "gpu",
         "compute_capability",
