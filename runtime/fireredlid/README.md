@@ -177,6 +177,16 @@ python3 runtime/fireredlid/verify.py \
   --engine-dir runtime/fireredlid/artifacts/engine
 ```
 
+```bash
+uv run python runtime/fireredlid/verify_labels.py \
+  --model-dir FireRedLID \
+  --manifest /path/to/representative-lid.jsonl \
+  --candidate-backend tensorrt \
+  --engine-dir runtime/fireredlid/artifacts/engine \
+  --confidence-atol 0.005 \
+  --report runtime/fireredlid/artifacts/engine/verify.labels.json
+```
+
 The engine directory contains:
 
 ```text
