@@ -5,7 +5,6 @@ import gc
 import json
 import math
 import platform
-import subprocess
 import sys
 from collections import Counter
 from decimal import Decimal, InvalidOperation
@@ -17,6 +16,13 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from fireredasr2s.fireredlid.runtime.provenance import (
+    collect_provenance,
+    engine_input_artifacts,
+    file_artifact,
+    model_input_artifacts,
+)
 
 
 def _decimal_confidence(value, source, uttid):
@@ -238,19 +244,6 @@ def _environment():
     }
 
 
-def _commit_hash():
-    try:
-        return subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=REPO_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        return "unknown"
-
-
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
@@ -310,19 +303,32 @@ def main(argv=None):
         gc.collect()
         torch.cuda.empty_cache()
 
+    report_arguments = {
+        "model_dir": args.model_dir,
+        "manifest": args.manifest,
+        "baseline_backend": "eager",
+        "candidate_backend": args.candidate_backend,
+        "device": "cuda",
+        "precision": "fp16",
+        "engine_dir": candidate_engine_dir,
+        "confidence_atol": args.confidence_atol,
+        "report": args.report,
+    }
+    input_artifacts = model_input_artifacts(args.model_dir)
+    input_artifacts["audio_manifest"] = file_artifact(args.manifest)
+    if args.candidate_backend == "tensorrt":
+        input_artifacts.update(engine_input_artifacts(args.engine_dir))
+    provenance = collect_provenance(
+        report_arguments,
+        input_artifacts,
+        REPO_ROOT,
+    )
     report = {
         "schema_version": 1,
-        "arguments": {
-            "model_dir": args.model_dir,
-            "manifest": args.manifest,
-            "baseline_backend": "eager",
-            "candidate_backend": args.candidate_backend,
-            "precision": "fp16",
-            "engine_dir": candidate_engine_dir,
-            "confidence_atol": args.confidence_atol,
-        },
+        "arguments": report_arguments,
         "environment": _environment(),
-        "commit_hash": _commit_hash(),
+        "commit_hash": provenance["git"]["commit"] or "unknown",
+        "provenance": provenance,
         **compare_results(
             baseline,
             candidate,

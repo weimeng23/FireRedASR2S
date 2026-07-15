@@ -17,6 +17,17 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from fireredasr2s.fireredlid.runtime.provenance import (
+    collect_provenance,
+    engine_input_artifacts,
+    file_artifact,
+    model_input_artifacts,
+)
+from fireredasr2s.fireredlid.runtime.benchmark_config import (
+    resolve_device,
+    validate_backend_device_precision,
+)
+
 
 class StageRecorder:
     def __init__(self, synchronize_cuda):
@@ -200,7 +211,7 @@ def _environment():
     }
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Benchmark FireRedLID eager, compile, or TensorRT inference."
     )
@@ -242,15 +253,43 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--output")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    try:
+        validate_backend_device_precision(
+            [args.backend],
+            args.device,
+            args.precision,
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    if args.backend == "tensorrt" and not args.engine_dir:
+        parser.error("TensorRT benchmark requires --engine-dir")
+    return args
 
 
 def main():
-    from fireredasr2s.fireredlid.lid import FireRedLid, FireRedLidConfig
-
     args = parse_args()
+    validate_backend_device_precision(
+        [args.backend],
+        args.device,
+        args.precision,
+    )
     if args.warmup < 0 or args.iterations < 1:
         raise ValueError("warmup must be non-negative and iterations positive")
+    if args.backend == "tensorrt" and not args.engine_dir:
+        raise ValueError("TensorRT benchmark requires --engine-dir")
+
+    resolved_device = resolve_device(
+        args.device,
+        torch.cuda.is_available(),
+    )
+    resolved_precision = args.precision
+    use_gpu = resolved_device == "cuda"
+    if use_gpu and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable")
+    if resolved_precision == "fp16" and not use_gpu:
+        raise ValueError("FP16 benchmark requires CUDA")
+
     records = load_manifest(args.manifest)
     logical_batch_size = args.logical_batch_size
     if logical_batch_size is None:
@@ -259,23 +298,11 @@ def main():
         raise ValueError("logical_batch_size must be positive")
     record_groups = _chunks(records, logical_batch_size)
 
-    use_gpu = (
-        torch.cuda.is_available()
-        if args.device == "auto"
-        else args.device == "cuda"
-    )
-    if use_gpu and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is unavailable")
-    if args.precision == "fp16" and not use_gpu:
-        raise ValueError("FP16 benchmark requires CUDA")
-    if args.backend == "tensorrt":
-        use_gpu = True
-        if not args.engine_dir:
-            raise ValueError("TensorRT benchmark requires --engine-dir")
+    from fireredasr2s.fireredlid.lid import FireRedLid, FireRedLidConfig
 
     config = FireRedLidConfig(
         use_gpu=use_gpu,
-        use_half=args.precision == "fp16" or args.backend == "tensorrt",
+        use_half=resolved_precision == "fp16",
         backend=args.backend,
         profile=args.profile,
         max_audio_seconds=args.max_audio_seconds,
@@ -346,11 +373,31 @@ def main():
         int(torch.cuda.max_memory_allocated()) if use_gpu else None
     )
 
+    report_arguments = {
+        **vars(args),
+        "requested_device": args.device,
+        "resolved_device": resolved_device,
+        "requested_precision": args.precision,
+        "resolved_precision": resolved_precision,
+    }
+    input_artifacts = model_input_artifacts(args.model_dir)
+    input_artifacts["audio_manifest"] = file_artifact(args.manifest)
+    if args.backend == "tensorrt":
+        input_artifacts.update(engine_input_artifacts(args.engine_dir))
     report = {
-        "arguments": vars(args),
+        "arguments": report_arguments,
         "environment": _environment(),
+        "provenance": collect_provenance(
+            report_arguments,
+            input_artifacts,
+            REPO_ROOT,
+        ),
         "requested_backend": args.backend,
         "active_backend": lid.active_backend,
+        "requested_device": args.device,
+        "resolved_device": resolved_device,
+        "requested_precision": args.precision,
+        "resolved_precision": resolved_precision,
         "first_run_s": first_run_s,
         "warmup_s": warmup_s,
         "stable_elapsed_s": stable_elapsed_s,

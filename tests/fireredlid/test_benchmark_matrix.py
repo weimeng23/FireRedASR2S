@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import shlex
 import subprocess
@@ -56,8 +57,14 @@ def execution_argv(tmp_path, *extra):
     manifest = tmp_path / "manifest.jsonl"
     engine_dir = tmp_path / "engine"
     model_dir.mkdir()
+    (model_dir / "model.pth.tar").write_bytes(b"checkpoint")
+    (model_dir / "cmvn.ark").write_bytes(b"cmvn")
+    (model_dir / "dict.txt").write_bytes(b"dictionary")
     manifest.write_text('{"uttid":"a","wav":"a.wav"}\n', encoding="utf-8")
     engine_dir.mkdir()
+    (engine_dir / "encoder.plan").write_bytes(b"engine")
+    (engine_dir / "manifest.json").write_text("{}\n", encoding="utf-8")
+    (engine_dir / "profiles.yaml").write_text("profiles: []\n", encoding="utf-8")
     return [
         "--model-dir",
         str(model_dir),
@@ -177,6 +184,54 @@ def test_tensorrt_commands_always_include_engine_dir(tmp_path):
         option_value(command, "--engine-dir") == str(engine_dir)
         for command in trt_commands
     )
+    assert all(option_value(command, "--device") == "cuda" for command in commands)
+    assert all(option_value(command, "--precision") == "fp16" for command in commands)
+
+
+@pytest.mark.parametrize(
+    ("device", "precision"),
+    [
+        ("auto", "fp16"),
+        ("cpu", "fp16"),
+        ("cuda", "fp32"),
+        ("cpu", "fp32"),
+    ],
+)
+def test_build_commands_rejects_non_cuda_fp16_tensorrt_selection(
+    tmp_path,
+    device,
+    precision,
+):
+    module = load_benchmark_matrix_module()
+    output_dir = tmp_path / "matrix"
+
+    with pytest.raises(ValueError, match="device=cuda.*precision=fp16"):
+        module.build_commands(
+            make_args(
+                output_dir=output_dir,
+                device=device,
+                precision=precision,
+            )
+        )
+
+    assert not output_dir.exists()
+
+
+def test_non_tensorrt_cpu_fp32_matrix_remains_supported(tmp_path):
+    module = load_benchmark_matrix_module()
+
+    commands = module.build_commands(
+        make_args(
+            output_dir=tmp_path,
+            backends=["eager", "compile"],
+            device="cpu",
+            precision="fp32",
+        )
+    )
+
+    assert commands
+    assert all(option_value(command, "--device") == "cpu" for command in commands)
+    assert all(option_value(command, "--precision") == "fp32" for command in commands)
 
 
 def test_default_tensorrt_selection_requires_engine_dir_argument():
@@ -279,6 +334,43 @@ def test_cli_rejects_duplicate_selectors_before_execute_side_effects(
     assert not (tmp_path / "matrix").exists()
 
 
+@pytest.mark.parametrize(
+    ("device", "precision"),
+    [("cpu", "fp16"), ("cuda", "fp32")],
+)
+def test_cli_rejects_invalid_tensorrt_config_before_output_or_subprocess(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    device,
+    precision,
+):
+    module = load_benchmark_matrix_module()
+    calls = []
+
+    def fake_run(command, check):
+        calls.append((command, check))
+        return subprocess.CompletedProcess(command, 0)
+
+    replace_subprocess_run(module, monkeypatch, fake_run)
+    argv = execution_argv(
+        tmp_path,
+        "--device",
+        device,
+        "--precision",
+        precision,
+        "--execute",
+    )
+
+    with pytest.raises(SystemExit) as error:
+        module.main(argv)
+
+    assert error.value.code == 2
+    assert calls == []
+    assert capsys.readouterr().out == ""
+    assert not (tmp_path / "matrix").exists()
+
+
 @pytest.mark.parametrize("missing", ["model", "manifest", "engine"])
 def test_execute_validates_all_required_paths_before_launch(
     tmp_path,
@@ -294,6 +386,8 @@ def test_execute_validates_all_required_paths_before_launch(
     }
     path = paths[missing]
     if path.is_dir():
+        for child in path.iterdir():
+            child.unlink()
         path.rmdir()
     else:
         path.unlink()
@@ -355,6 +449,25 @@ def test_execute_uses_list_commands_and_writes_complete_index(
         "gpu",
     }
     assert len(index["commit_hash"]) == 40
+    artifacts = index["provenance"]["input_artifacts"]
+    assert set(artifacts) == {
+        "checkpoint",
+        "cmvn",
+        "dictionary",
+        "audio_manifest",
+    }
+    assert artifacts["checkpoint"]["sha256"] == hashlib.sha256(
+        b"checkpoint"
+    ).hexdigest()
+    assert artifacts["audio_manifest"]["sha256"] == hashlib.sha256(
+        Path(argv[argv.index("--manifest") + 1]).read_bytes()
+    ).hexdigest()
+    assert index["provenance"]["arguments"]["device"] == "cuda"
+    assert index["requested_device"] == "cuda"
+    assert index["resolved_device"] == "cuda"
+    assert index["requested_precision"] == "fp16"
+    assert index["resolved_precision"] == "fp16"
+    json.dumps(index["provenance"])
     assert index["runs"] == [
         {
             "command": command,

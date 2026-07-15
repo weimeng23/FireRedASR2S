@@ -16,6 +16,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from fireredasr2s.fireredlid.lid import load_fireredlid_model
+from fireredasr2s.fireredlid.runtime.provenance import (
+    collect_provenance,
+    engine_input_artifacts,
+    file_artifact,
+    onnx_bundle_artifact,
+)
 
 
 def verify_onnx_outputs(
@@ -260,13 +266,24 @@ def main():
             else Path(args.engine_dir) / "verify.fp16.json"
         )
     )
+    report_arguments = {
+        **vars(args),
+        "resolved_rtol": rtol,
+        "resolved_atol": atol,
+    }
+    input_artifacts = {"checkpoint": file_artifact(checkpoint_path)}
+    if args.backend == "onnx":
+        input_artifacts["onnx_bundle"] = onnx_bundle_artifact(args.onnx)
+    else:
+        input_artifacts.update(engine_input_artifacts(args.engine_dir))
     report = {
-        "arguments": {
-            **vars(args),
-            "resolved_rtol": rtol,
-            "resolved_atol": atol,
-        },
+        "arguments": report_arguments,
         "environment": environment(),
+        "provenance": collect_provenance(
+            report_arguments,
+            input_artifacts,
+            REPO_ROOT,
+        ),
         "cases": cases,
         "passed": not failed,
     }

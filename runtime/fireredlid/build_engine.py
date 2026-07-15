@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import platform
@@ -21,6 +20,11 @@ if str(REPO_ROOT) not in sys.path:
 from fireredasr2s.fireredlid.runtime.tensorrt_backend import (
     BackendUnavailableError,
     sha256_file,
+)
+from fireredasr2s.fireredlid.runtime.provenance import (
+    collect_provenance,
+    file_artifact,
+    onnx_bundle_artifact,
 )
 
 
@@ -88,34 +92,11 @@ def flatten_profiles(profile_config):
     ]
 
 
-def _update_digest_from_file(digest, label, path):
-    digest.update(label.encode("utf-8"))
-    digest.update(b"\0")
-    with Path(path).open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-
-
 def sha256_onnx_bundle(onnx_path):
-    onnx_path = Path(onnx_path)
-    model = onnx.load(onnx_path, load_external_data=False)
-    external_locations = set()
-    for initializer in model.graph.initializer:
-        for item in initializer.external_data:
-            if item.key == "location":
-                external_locations.add(item.value)
-    digest = hashlib.sha256()
-    _update_digest_from_file(digest, onnx_path.name, onnx_path)
-    for location in sorted(external_locations):
-        _update_digest_from_file(
-            digest,
-            location,
-            onnx_path.parent / location,
-        )
-    return digest.hexdigest()
+    return onnx_bundle_artifact(onnx_path)["sha256"]
 
 
-def inspect_onnx_bundle(onnx_path):
+def _inspect_onnx_bundle(onnx_path):
     onnx_path = Path(onnx_path).resolve()
     if not onnx_path.is_file():
         raise FileNotFoundError(f"missing ONNX graph: {onnx_path}")
@@ -163,28 +144,56 @@ def inspect_onnx_bundle(onnx_path):
     if missing:
         raise FileNotFoundError(f"missing external ONNX data: {missing}")
     onnx.checker.check_model(onnx_path)
+    bundle = onnx_bundle_artifact(onnx_path)
     return {
         "opset": 17,
         "input_names": input_names,
         "output_names": output_names,
         "external_file_count": len(locations),
         "missing_external_files": missing,
-        "onnx_bundle_sha256": sha256_onnx_bundle(onnx_path),
-    }
+        "onnx_bundle_sha256": bundle["sha256"],
+    }, bundle
 
 
-def preflight_artifacts(onnx_path, checkpoint_path, profile_path):
+def inspect_onnx_bundle(onnx_path):
+    report, unused_bundle = _inspect_onnx_bundle(onnx_path)
+    return report
+
+
+def preflight_artifacts(
+    onnx_path,
+    checkpoint_path,
+    profile_path,
+    arguments=None,
+):
+    onnx_path = Path(onnx_path).resolve()
     checkpoint_path = Path(checkpoint_path).resolve()
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"missing checkpoint: {checkpoint_path}")
     profile_path = Path(profile_path).resolve()
     load_profile(profile_path)
-    report = inspect_onnx_bundle(onnx_path)
+    report, onnx_artifact = _inspect_onnx_bundle(onnx_path)
+    input_artifacts = {
+        "checkpoint": file_artifact(checkpoint_path),
+        "onnx_bundle": onnx_artifact,
+        "profiles": file_artifact(profile_path),
+    }
+    if arguments is None:
+        arguments = {
+            "onnx": str(onnx_path),
+            "checkpoint": str(checkpoint_path),
+            "profiles": str(profile_path),
+        }
     report.update(
         {
-            "checkpoint_sha256": sha256_file(checkpoint_path),
-            "profile_sha256": sha256_file(profile_path),
+            "checkpoint_sha256": input_artifacts["checkpoint"]["sha256"],
+            "profile_sha256": input_artifacts["profiles"]["sha256"],
             "ready_for_tensorrt_build": True,
+            "provenance": collect_provenance(
+                arguments,
+                input_artifacts,
+                REPO_ROOT,
+            ),
         }
     )
     return report
@@ -259,8 +268,15 @@ def write_manifest(
     )
 
 
-def build_engine(onnx_path, output_dir, profile_path, checkpoint_path):
-    preflight_artifacts(onnx_path, checkpoint_path, profile_path)
+def build_engine(
+    onnx_path,
+    output_dir,
+    profile_path,
+    checkpoint_path,
+    preflight_report=None,
+):
+    if preflight_report is None:
+        preflight_artifacts(onnx_path, checkpoint_path, profile_path)
     trt = require_tensorrt()
     onnx_path = Path(onnx_path).resolve()
     output_dir = Path(output_dir)
@@ -354,6 +370,7 @@ def main():
         args.onnx,
         args.checkpoint,
         args.profiles,
+        arguments=vars(args),
     )
     if args.report:
         Path(args.report).write_text(
@@ -368,6 +385,7 @@ def main():
         args.output_dir,
         args.profiles,
         args.checkpoint,
+        preflight_report=report,
     )
     print(path)
 

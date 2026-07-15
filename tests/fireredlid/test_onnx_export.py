@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -44,6 +45,34 @@ def load_verify_module():
     return module
 
 
+def write_hashable_onnx(path):
+    graph = helper.make_graph(
+        [helper.make_node("Identity", ["features"], ["encoder_outputs"])],
+        "verify-provenance-test",
+        [
+            helper.make_tensor_value_info(
+                "features",
+                TensorProto.FLOAT,
+                [None, None, 80],
+            )
+        ],
+        [
+            helper.make_tensor_value_info(
+                "encoder_outputs",
+                TensorProto.FLOAT,
+                [None, None, 80],
+            )
+        ],
+    )
+    onnx.save_model(
+        helper.make_model(
+            graph,
+            opset_imports=[helper.make_opsetid("", 17)],
+        ),
+        path,
+    )
+
+
 def run_onnx_verification(
     monkeypatch,
     tmp_path,
@@ -54,10 +83,15 @@ def run_onnx_verification(
 ):
     verify_module = load_verify_module()
     report_path = tmp_path / "verify.json"
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.pth.tar").write_bytes(b"checkpoint")
+    onnx_path = tmp_path / "encoder.onnx"
+    write_hashable_onnx(onnx_path)
     args = SimpleNamespace(
-        model_dir="model",
+        model_dir=str(model_dir),
         backend="onnx",
-        onnx="encoder.onnx",
+        onnx=str(onnx_path),
         engine_dir=None,
         report=str(report_path),
         seconds=[1],
@@ -115,6 +149,17 @@ def run_tensorrt_verification(
     verify_module = load_verify_module()
     report_path = tmp_path / "verify.json"
     observed_tolerances = {}
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "model.pth.tar").write_bytes(b"checkpoint")
+    engine_dir = tmp_path / "engine"
+    engine_dir.mkdir()
+    (engine_dir / "encoder.plan").write_bytes(b"engine")
+    (engine_dir / "manifest.json").write_text("{}\n", encoding="utf-8")
+    (engine_dir / "profiles.yaml").write_text(
+        "profiles: []\n",
+        encoding="utf-8",
+    )
 
     class FakeEncoder:
         def half(self):
@@ -144,11 +189,11 @@ def run_tensorrt_verification(
         [
             "verify.py",
             "--model-dir",
-            "model",
+            str(model_dir),
             "--backend",
             "tensorrt",
             "--engine-dir",
-            "engine",
+            str(engine_dir),
             "--report",
             str(report_path),
             "--seconds",
@@ -409,6 +454,15 @@ def test_main_passes_and_records_tensorrt_default_tolerances(
     assert report["arguments"]["resolved_rtol"] == 0.02
     assert report["arguments"]["resolved_atol"] == 0.02
     assert observed_tolerances == {"rtol": 0.02, "atol": 0.02}
+    assert set(report["provenance"]["input_artifacts"]) == {
+        "checkpoint",
+        "engine",
+        "engine_manifest",
+        "profiles",
+    }
+    assert report["provenance"]["input_artifacts"]["engine"][
+        "sha256"
+    ] == hashlib.sha256(b"engine").hexdigest()
 
 
 @pytest.mark.parametrize(
@@ -459,13 +513,27 @@ def test_report_records_onnx_defaults_and_compatible_case_fields(
     )
 
     assert exit_code == 0
-    assert set(report) == {"arguments", "environment", "cases", "passed"}
+    assert set(report) == {
+        "arguments",
+        "environment",
+        "provenance",
+        "cases",
+        "passed",
+    }
     assert report["arguments"]["rtol"] is None
     assert report["arguments"]["atol"] is None
     assert report["arguments"]["resolved_rtol"] == 1e-3
     assert report["arguments"]["resolved_atol"] == 1e-4
     assert report["environment"]
     assert report["passed"] is True
+    artifacts = report["provenance"]["input_artifacts"]
+    assert set(artifacts) == {"checkpoint", "onnx_bundle"}
+    assert artifacts["checkpoint"]["sha256"] == hashlib.sha256(
+        b"checkpoint"
+    ).hexdigest()
+    assert artifacts["onnx_bundle"]["sha256"] == hashlib.sha256(
+        b"encoder.onnx\0" + (tmp_path / "encoder.onnx").read_bytes()
+    ).hexdigest()
     assert set(report["cases"][0]) == {
         "seconds",
         "batch_size",

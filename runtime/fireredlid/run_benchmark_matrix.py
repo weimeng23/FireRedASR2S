@@ -10,6 +10,21 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from fireredasr2s.fireredlid.runtime.provenance import (
+    collect_provenance,
+    engine_input_artifacts,
+    file_artifact,
+    model_input_artifacts,
+)
+from fireredasr2s.fireredlid.runtime.benchmark_config import (
+    resolve_device,
+    validate_backend_device_precision,
+)
+
+
 BENCHMARK_SCRIPT = Path(__file__).resolve().with_name("benchmark.py")
 BACKENDS = ["eager", "compile", "tensorrt"]
 SCOPES = ["encoder", "model", "end-to-end"]
@@ -38,6 +53,11 @@ def _validate_unique_selectors(args):
 
 def build_commands(args) -> list[list[str]]:
     _validate_unique_selectors(args)
+    validate_backend_device_precision(
+        args.backends,
+        args.device,
+        args.precision,
+    )
     if "tensorrt" in args.backends and not args.engine_dir:
         raise ValueError("TensorRT matrix requires --engine-dir")
 
@@ -96,17 +116,6 @@ def _environment():
         "cuda": torch.version.cuda,
         "gpu": gpu,
     }
-
-
-def _commit_hash():
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=REPO_ROOT,
-            text=True,
-        ).strip()
-    except (OSError, subprocess.CalledProcessError):
-        return "unknown"
 
 
 def _validate_execute_paths(args):
@@ -177,6 +186,11 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     try:
         _validate_unique_selectors(args)
+        validate_backend_device_precision(
+            args.backends,
+            args.device,
+            args.precision,
+        )
     except ValueError as error:
         parser.error(str(error))
     if "tensorrt" in args.backends and not args.engine_dir:
@@ -195,26 +209,53 @@ def main(argv=None):
     if not args.execute:
         return 0
 
+    import torch
+
+    resolved_device = resolve_device(
+        args.device,
+        torch.cuda.is_available(),
+    )
+    resolved_precision = args.precision
+    report_arguments = {
+        "model_dir": str(args.model_dir),
+        "manifest": str(args.manifest),
+        "engine_dir": (
+            str(args.engine_dir) if args.engine_dir is not None else None
+        ),
+        "profile": args.profile,
+        "backends": list(args.backends),
+        "scopes": list(args.scopes),
+        "device": args.device,
+        "precision": args.precision,
+        "requested_device": args.device,
+        "resolved_device": resolved_device,
+        "requested_precision": args.precision,
+        "resolved_precision": resolved_precision,
+        "output_dir": str(args.output_dir),
+        "execute": args.execute,
+    }
+    input_artifacts = model_input_artifacts(args.model_dir)
+    input_artifacts["audio_manifest"] = file_artifact(args.manifest)
+    if "tensorrt" in args.backends:
+        input_artifacts.update(engine_input_artifacts(args.engine_dir))
+    provenance = collect_provenance(
+        report_arguments,
+        input_artifacts,
+        REPO_ROOT,
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     index_path = args.output_dir / "matrix.index.json"
     index = {
         "schema_version": 1,
-        "arguments": {
-            "model_dir": str(args.model_dir),
-            "manifest": str(args.manifest),
-            "engine_dir": (
-                str(args.engine_dir) if args.engine_dir is not None else None
-            ),
-            "profile": args.profile,
-            "backends": list(args.backends),
-            "scopes": list(args.scopes),
-            "device": args.device,
-            "precision": args.precision,
-            "output_dir": str(args.output_dir),
-        },
+        "arguments": report_arguments,
         "profile": args.profile,
+        "requested_device": args.device,
+        "resolved_device": resolved_device,
+        "requested_precision": args.precision,
+        "resolved_precision": resolved_precision,
         "environment": _environment(),
-        "commit_hash": _commit_hash(),
+        "commit_hash": provenance["git"]["commit"] or "unknown",
+        "provenance": provenance,
         "runs": [],
     }
     for command in commands:

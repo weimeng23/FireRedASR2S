@@ -787,6 +787,23 @@ def test_preflight_reports_exact_encoder_contract(tmp_path):
     assert report["external_file_count"] > 0
     assert report["missing_external_files"] == []
     assert report["ready_for_tensorrt_build"] is True
+    artifacts = report["provenance"]["input_artifacts"]
+    assert set(artifacts) == {"checkpoint", "onnx_bundle", "profiles"}
+    assert artifacts["checkpoint"]["sha256"] == hashlib.sha256(
+        checkpoint.read_bytes()
+    ).hexdigest()
+    assert artifacts["profiles"]["sha256"] == hashlib.sha256(
+        profiles.read_bytes()
+    ).hexdigest()
+    assert artifacts["onnx_bundle"]["sha256"] == report[
+        "onnx_bundle_sha256"
+    ]
+    assert report["provenance"]["arguments"] == {
+        "onnx": str(onnx_path),
+        "checkpoint": str(checkpoint),
+        "profiles": str(profiles),
+    }
+    json.dumps(report["provenance"])
 
 
 def test_preflight_rejects_missing_external_weight(tmp_path):

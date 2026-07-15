@@ -1,5 +1,8 @@
 import importlib.util
+import hashlib
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -190,3 +193,63 @@ def test_parse_args_rejects_non_finite_confidence_atol(confidence_atol):
         )
 
     assert error.value.code == 2
+
+
+def test_main_report_includes_common_provenance_and_real_input_hashes(
+    tmp_path,
+    monkeypatch,
+):
+    module = load_verify_labels_module()
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    model_files = {
+        "checkpoint": model_dir / "model.pth.tar",
+        "cmvn": model_dir / "cmvn.ark",
+        "dictionary": model_dir / "dict.txt",
+    }
+    for name, path in model_files.items():
+        path.write_bytes(name.encode("utf-8"))
+    manifest = tmp_path / "input.jsonl"
+    manifest.write_text(
+        '{"uttid":"a","wav":"a.wav"}\n',
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "verify.labels.json"
+    args = SimpleNamespace(
+        model_dir=str(model_dir),
+        manifest=str(manifest),
+        candidate_backend="compile",
+        engine_dir=None,
+        confidence_atol=0.005,
+        report=str(report_path),
+    )
+    result = [{"uttid": "a", "lang": "en", "confidence": 0.9}]
+    monkeypatch.setattr(module, "parse_args", lambda argv=None: args)
+    monkeypatch.setattr(module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(module.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        module,
+        "run_backend",
+        lambda *unused_args, **unused_kwargs: result,
+    )
+    monkeypatch.setattr(module, "_environment", lambda: {"gpu": "test"})
+
+    assert module.main([]) == 0
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    artifacts = report["provenance"]["input_artifacts"]
+    assert set(artifacts) == {
+        "checkpoint",
+        "cmvn",
+        "dictionary",
+        "audio_manifest",
+    }
+    for name, path in model_files.items():
+        assert artifacts[name]["sha256"] == hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+    assert artifacts["audio_manifest"]["sha256"] == hashlib.sha256(
+        manifest.read_bytes()
+    ).hexdigest()
+    assert report["provenance"]["arguments"]["candidate_backend"] == "compile"
+    json.dumps(report["provenance"])
