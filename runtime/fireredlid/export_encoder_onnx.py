@@ -55,6 +55,7 @@ def export_encoder(
         opset_version=17,
         do_constant_folding=True,
         external_data=True,
+        dynamo=False,
     )
     return output_path
 
