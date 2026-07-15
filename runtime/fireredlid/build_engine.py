@@ -115,6 +115,81 @@ def sha256_onnx_bundle(onnx_path):
     return digest.hexdigest()
 
 
+def inspect_onnx_bundle(onnx_path):
+    onnx_path = Path(onnx_path).resolve()
+    if not onnx_path.is_file():
+        raise FileNotFoundError(f"missing ONNX graph: {onnx_path}")
+    model = onnx.load(onnx_path, load_external_data=False)
+    opsets = [
+        item.version for item in model.opset_import if item.domain == ""
+    ]
+    if opsets != [17]:
+        raise ValueError(f"expected ONNX opset 17, got {opsets}")
+    input_names = [value.name for value in model.graph.input]
+    output_names = [value.name for value in model.graph.output]
+    if input_names != INPUT_NAMES or output_names != OUTPUT_NAMES:
+        raise ValueError(
+            f"ONNX tensor contract mismatch: inputs={input_names}, "
+            f"outputs={output_names}"
+        )
+    locations = sorted(
+        {
+            item.value
+            for initializer in model.graph.initializer
+            for item in initializer.external_data
+            if item.key == "location"
+        }
+    )
+    for location in locations:
+        relative_path = Path(location)
+        if relative_path.is_absolute():
+            raise ValueError(
+                f"absolute external ONNX data location is not allowed: "
+                f"{location}"
+            )
+        resolved_path = (onnx_path.parent / relative_path).resolve()
+        try:
+            resolved_path.relative_to(onnx_path.parent)
+        except ValueError as error:
+            raise ValueError(
+                f"external ONNX data location escapes graph directory: "
+                f"{location}"
+            ) from error
+    missing = [
+        location
+        for location in locations
+        if not (onnx_path.parent / location).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(f"missing external ONNX data: {missing}")
+    onnx.checker.check_model(onnx_path)
+    return {
+        "opset": 17,
+        "input_names": input_names,
+        "output_names": output_names,
+        "external_file_count": len(locations),
+        "missing_external_files": missing,
+        "onnx_bundle_sha256": sha256_onnx_bundle(onnx_path),
+    }
+
+
+def preflight_artifacts(onnx_path, checkpoint_path, profile_path):
+    checkpoint_path = Path(checkpoint_path).resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"missing checkpoint: {checkpoint_path}")
+    profile_path = Path(profile_path).resolve()
+    load_profile(profile_path)
+    report = inspect_onnx_bundle(onnx_path)
+    report.update(
+        {
+            "checkpoint_sha256": sha256_file(checkpoint_path),
+            "profile_sha256": sha256_file(profile_path),
+            "ready_for_tensorrt_build": True,
+        }
+    )
+    return report
+
+
 def require_tensorrt():
     if (
         sys.platform != "linux"
@@ -177,6 +252,7 @@ def write_manifest(
 
 
 def build_engine(onnx_path, output_dir, profile_path, checkpoint_path):
+    preflight_artifacts(onnx_path, checkpoint_path, profile_path)
     trt = require_tensorrt()
     onnx_path = Path(onnx_path).resolve()
     output_dir = Path(output_dir)
@@ -255,11 +331,26 @@ def parse_args():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--profiles", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--report")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    report = preflight_artifacts(
+        args.onnx,
+        args.checkpoint,
+        args.profiles,
+    )
+    if args.report:
+        Path(args.report).write_text(
+            json.dumps(report, indent=2),
+            encoding="utf-8",
+        )
+    if args.preflight_only:
+        print(json.dumps(report, indent=2))
+        return
     path = build_engine(
         args.onnx,
         args.output_dir,

@@ -4,7 +4,10 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
+import onnx
 import pytest
+from onnx import TensorProto, external_data_helper, helper, numpy_helper
 
 from fireredasr2s.fireredlid.runtime.tensorrt_backend import (
     ArtifactMismatchError,
@@ -55,6 +58,117 @@ def write_manifest(path, data=None):
         json.dumps(data or manifest_data()),
         encoding="utf-8",
     )
+
+
+def write_valid_preflight_bundle(tmp_path):
+    onnx_path = tmp_path / "encoder.onnx"
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+
+    weight = numpy_helper.from_array(
+        np.eye(80, dtype=np.float32),
+        name="weight",
+    )
+    external_data_helper.set_external_data(
+        weight,
+        location="data/weight",
+    )
+    reduce_axes = numpy_helper.from_array(
+        np.array([2], dtype=np.int64),
+        name="reduce_axes",
+    )
+    channel_axis = numpy_helper.from_array(
+        np.array([1], dtype=np.int64),
+        name="channel_axis",
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "MatMul",
+                ["features", "weight"],
+                ["encoder_outputs"],
+            ),
+            helper.make_node(
+                "Identity",
+                ["feature_lengths"],
+                ["encoder_lengths"],
+            ),
+            helper.make_node(
+                "ReduceSum",
+                ["features", "reduce_axes"],
+                ["mask_values"],
+                keepdims=0,
+            ),
+            helper.make_node(
+                "Cast",
+                ["mask_values"],
+                ["mask_uint8"],
+                to=TensorProto.UINT8,
+            ),
+            helper.make_node(
+                "Unsqueeze",
+                ["mask_uint8", "channel_axis"],
+                ["encoder_mask"],
+            ),
+        ],
+        "preflight-test",
+        [
+            helper.make_tensor_value_info(
+                "features",
+                TensorProto.FLOAT,
+                ["batch", "time", 80],
+            ),
+            helper.make_tensor_value_info(
+                "feature_lengths",
+                TensorProto.INT64,
+                ["batch"],
+            ),
+        ],
+        [
+            helper.make_tensor_value_info(
+                "encoder_outputs",
+                TensorProto.FLOAT,
+                ["batch", "time", 80],
+            ),
+            helper.make_tensor_value_info(
+                "encoder_lengths",
+                TensorProto.INT64,
+                ["batch"],
+            ),
+            helper.make_tensor_value_info(
+                "encoder_mask",
+                TensorProto.UINT8,
+                ["batch", 1, "time"],
+            ),
+        ],
+        [weight, reduce_axes, channel_axis],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 17)],
+    )
+    onnx.save_model(model, onnx_path)
+
+    checkpoint = tmp_path / "model.pth.tar"
+    checkpoint.write_bytes(b"checkpoint")
+    profiles = tmp_path / "profiles.yaml"
+    profiles.write_text(
+        """
+schema_version: 1
+profiles:
+  - name: default
+    features:
+      min: [1, 1, 80]
+      opt: [2, 1000, 80]
+      max: [4, 6000, 80]
+    feature_lengths:
+      min: [1]
+      opt: [2]
+      max: [4]
+""".strip(),
+        encoding="utf-8",
+    )
+    return onnx_path, checkpoint, profiles
 
 
 def test_manifest_exposes_max_batch_and_selects_profile(tmp_path):
@@ -129,3 +243,46 @@ profiles:
             "max": [4, 6000, 80],
         }
     ]
+
+
+def test_preflight_reports_exact_encoder_contract(tmp_path):
+    module = load_build_module()
+    onnx_path, checkpoint, profiles = write_valid_preflight_bundle(tmp_path)
+
+    report = module.preflight_artifacts(onnx_path, checkpoint, profiles)
+
+    assert report["opset"] == 17
+    assert report["input_names"] == ["features", "feature_lengths"]
+    assert report["output_names"] == [
+        "encoder_outputs",
+        "encoder_lengths",
+        "encoder_mask",
+    ]
+    assert report["external_file_count"] > 0
+    assert report["missing_external_files"] == []
+    assert report["ready_for_tensorrt_build"] is True
+
+
+def test_preflight_rejects_missing_external_weight(tmp_path):
+    module = load_build_module()
+    onnx_path, checkpoint, profiles = write_valid_preflight_bundle(tmp_path)
+    next((onnx_path.parent / "data").iterdir()).unlink()
+
+    with pytest.raises(FileNotFoundError, match="external ONNX data"):
+        module.preflight_artifacts(onnx_path, checkpoint, profiles)
+
+
+def test_preflight_runs_before_tensorrt_platform_check(tmp_path, monkeypatch):
+    module = load_build_module()
+    onnx_path, checkpoint, profiles = write_valid_preflight_bundle(tmp_path)
+    monkeypatch.setattr(
+        module,
+        "require_tensorrt",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("TensorRT import must not run during preflight")
+        ),
+    )
+
+    report = module.preflight_artifacts(onnx_path, checkpoint, profiles)
+
+    assert report["ready_for_tensorrt_build"] is True
