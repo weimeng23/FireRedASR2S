@@ -105,6 +105,89 @@ def run_onnx_verification(
     )
 
 
+def run_tensorrt_verification(
+    monkeypatch,
+    tmp_path,
+    tolerance_args,
+):
+    from fireredasr2s.fireredlid.runtime import tensorrt_backend
+
+    verify_module = load_verify_module()
+    report_path = tmp_path / "verify.json"
+    observed_tolerances = {}
+
+    class FakeEncoder:
+        def half(self):
+            return self
+
+        def cuda(self):
+            return self
+
+        def eval(self):
+            return self
+
+    def verify_outputs(
+        unused_encoder,
+        unused_backend,
+        unused_features,
+        unused_lengths,
+        *,
+        rtol,
+        atol,
+    ):
+        observed_tolerances.update(rtol=rtol, atol=atol)
+        return {"max_abs_error": 0.0}
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "verify.py",
+            "--model-dir",
+            "model",
+            "--backend",
+            "tensorrt",
+            "--engine-dir",
+            "engine",
+            "--report",
+            str(report_path),
+            "--seconds",
+            "1",
+            "--batch-sizes",
+            "1",
+            *tolerance_args,
+        ],
+    )
+    monkeypatch.setattr(
+        verify_module,
+        "load_fireredlid_model",
+        lambda unused_path: SimpleNamespace(encoder=FakeEncoder()),
+    )
+    monkeypatch.setattr(
+        tensorrt_backend,
+        "TensorRTEncoderBackend",
+        lambda *unused_args, **unused_kwargs: object(),
+    )
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda tensor: tensor)
+    monkeypatch.setattr(
+        verify_module,
+        "verify_backend_outputs",
+        verify_outputs,
+    )
+    monkeypatch.setattr(
+        verify_module,
+        "environment",
+        lambda: {"platform": "test"},
+    )
+
+    verify_module.main()
+
+    return (
+        json.loads(report_path.read_text(encoding="utf-8")),
+        observed_tolerances,
+    )
+
+
 def test_export_supports_dynamic_batch_and_time(tmp_path):
     module = load_export_module()
     path = tmp_path / "encoder.onnx"
@@ -307,6 +390,63 @@ def test_verify_backend_outputs_uses_tensorrt_tolerances_by_default():
     )
 
     assert report["max_abs_error"] == pytest.approx(0.015)
+
+
+def test_main_passes_and_records_tensorrt_default_tolerances(
+    monkeypatch,
+    tmp_path,
+):
+    report, observed_tolerances = run_tensorrt_verification(
+        monkeypatch,
+        tmp_path,
+        [],
+    )
+
+    assert report["passed"] is True
+    assert report["arguments"]["backend"] == "tensorrt"
+    assert report["arguments"]["rtol"] is None
+    assert report["arguments"]["atol"] is None
+    assert report["arguments"]["resolved_rtol"] == 0.02
+    assert report["arguments"]["resolved_atol"] == 0.02
+    assert observed_tolerances == {"rtol": 0.02, "atol": 0.02}
+
+
+@pytest.mark.parametrize(
+    (
+        "tolerance_args",
+        "raw_rtol",
+        "raw_atol",
+        "resolved_rtol",
+        "resolved_atol",
+    ),
+    [
+        (["--rtol", "0.03"], 0.03, None, 0.03, 0.02),
+        (["--atol", "0.04"], None, 0.04, 0.02, 0.04),
+    ],
+)
+def test_main_passes_and_records_independent_tensorrt_overrides(
+    monkeypatch,
+    tmp_path,
+    tolerance_args,
+    raw_rtol,
+    raw_atol,
+    resolved_rtol,
+    resolved_atol,
+):
+    report, observed_tolerances = run_tensorrt_verification(
+        monkeypatch,
+        tmp_path,
+        tolerance_args,
+    )
+
+    assert report["arguments"]["rtol"] == raw_rtol
+    assert report["arguments"]["atol"] == raw_atol
+    assert report["arguments"]["resolved_rtol"] == resolved_rtol
+    assert report["arguments"]["resolved_atol"] == resolved_atol
+    assert observed_tolerances == {
+        "rtol": resolved_rtol,
+        "atol": resolved_atol,
+    }
 
 
 def test_report_records_onnx_defaults_and_compatible_case_fields(
