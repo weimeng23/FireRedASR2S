@@ -170,10 +170,18 @@ apply.
 
 Copy the complete ONNX artifact directory, the model checkpoint, and this
 repository to the target RTX PRO 5000 or L20 host. Keep one engine directory
-per GPU class and TensorRT/CUDA software stack. The commands below build and
-verify the RTX PRO 5000 engine in its dedicated directory:
+per GPU class and TensorRT/CUDA software stack. The commands below preflight,
+build, and verify the RTX PRO 5000 engine in its dedicated directory:
 
 ```bash
+python3 runtime/fireredlid/build_engine.py \
+  --onnx runtime/fireredlid/artifacts/torch2.10-opset17-fp32/encoder.fp32.onnx \
+  --checkpoint FireRedLID/model.pth.tar \
+  --profiles runtime/fireredlid/profiles.yaml \
+  --output-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine \
+  --preflight-only \
+  --report runtime/fireredlid/artifacts/rtx-pro-5000.engine.preflight.json
+
 python3 runtime/fireredlid/build_engine.py \
   --onnx runtime/fireredlid/artifacts/torch2.10-opset17-fp32/encoder.fp32.onnx \
   --checkpoint FireRedLID/model.pth.tar \
@@ -183,10 +191,23 @@ python3 runtime/fireredlid/build_engine.py \
 python3 runtime/fireredlid/verify.py \
   --model-dir FireRedLID \
   --backend tensorrt \
-  --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine
+  --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine \
+  --rtol 0.02 \
+  --atol 0.02 \
+  --report runtime/fireredlid/artifacts/rtx-pro-5000/engine/verify.encoder.fp16.json
 ```
 
+Run final-label parity once for compile and once for TensorRT against the same
+eager-FP16 baseline and representative manifest:
+
 ```bash
+uv run python runtime/fireredlid/verify_labels.py \
+  --model-dir FireRedLID \
+  --manifest /path/to/representative-lid.jsonl \
+  --candidate-backend compile \
+  --confidence-atol 0.005 \
+  --report runtime/fireredlid/artifacts/rtx-pro-5000/verify.labels.compile.json
+
 uv run python runtime/fireredlid/verify_labels.py \
   --model-dir FireRedLID \
   --manifest /path/to/representative-lid.jsonl \

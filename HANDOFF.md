@@ -70,11 +70,10 @@ cdcdb35 docs(fireredlid): clarify frontend and encoder contracts
 ```
 
 The Phase A snapshot above remains the starting point for the active Linux
-NVIDIA plan. Mac-developable Phase B Tasks 1-5 are committed through
-`9fa4b85` (`test(fireredlid): cover TensorRT tolerance propagation`). Task 6
-adds the deterministic benchmark-matrix runner and this handoff update. GPU
-build, correctness, and performance evidence remain a separate user-run Linux
-acceptance task.
+NVIDIA plan. Mac-developable Phase B Tasks 1-6 and the final report-provenance
+fix are independently reviewed through `044083a` (`fix(fireredlid): harden
+benchmark report provenance`). GPU build, correctness, and performance evidence
+remain a separate user-run Linux acceptance task.
 
 Important details:
 
@@ -122,7 +121,7 @@ Important details:
    audio-seconds/s, RTF, padding ratio, physical shapes and peak CUDA memory.
 10. Latency and throughput example configurations and the Linux handoff are
     documented in `runtime/fireredlid/README.md`.
-11. The 103-test FireRedLID unit/contract suite covers the mask, feature
+11. The 120-test FireRedLID unit/contract suite covers the mask, feature
     truncation, planner, backend adapter, configuration, result ordering, ONNX
     export, verification, benchmark summary, TensorRT artifact validation, and
     benchmark orchestration.
@@ -260,9 +259,9 @@ batching, three warm-ups, and 20 measured iterations.
 This completion is limited to orchestration and Mac-testable contracts. No
 TensorRT engine, CUDA compile result, label-parity result, RTX PRO 5000/L20
 timing, or matrix index from a real Linux GPU run has been produced yet.
-Fresh Mac verification after Task 6 passed all 103 FireRedLID tests with the
-four pre-existing legacy ONNX exporter warnings. The exact latency dry-run
-printed nine commands and created no output directory.
+Fresh Mac verification after the final review fixes passed all 120 FireRedLID
+tests with the four pre-existing legacy ONNX exporter warnings. The exact
+latency dry-run printed nine commands and created no output directory.
 
 ### Not yet completed
 
@@ -473,7 +472,7 @@ Runtime/contract tests:
 uv run python -m pytest tests/fireredlid -v
 ```
 
-Expected Phase B result: 103 passed with four legacy ONNX exporter warnings; no
+Expected Phase B Mac result: 120 passed with four legacy ONNX exporter warnings; no
 `onnxscript` dependency is required. Re-run the complete suite after copying
 the Phase B commits rather than relying on the earlier 29-test Phase A
 snapshot.
@@ -566,12 +565,38 @@ uv run python runtime/fireredlid/build_engine.py \
   --onnx runtime/fireredlid/artifacts/torch2.10-opset17-fp32/encoder.fp32.onnx \
   --checkpoint FireRedLID/model.pth.tar \
   --profiles runtime/fireredlid/profiles.yaml \
+  --output-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine \
+  --preflight-only \
+  --report runtime/fireredlid/artifacts/rtx-pro-5000.engine.preflight.json
+
+uv run python runtime/fireredlid/build_engine.py \
+  --onnx runtime/fireredlid/artifacts/torch2.10-opset17-fp32/encoder.fp32.onnx \
+  --checkpoint FireRedLID/model.pth.tar \
+  --profiles runtime/fireredlid/profiles.yaml \
   --output-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine
 
 uv run python runtime/fireredlid/verify.py \
   --model-dir FireRedLID \
   --backend tensorrt \
-  --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine
+  --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine \
+  --rtol 0.02 \
+  --atol 0.02 \
+  --report runtime/fireredlid/artifacts/rtx-pro-5000/engine/verify.encoder.fp16.json
+
+uv run python runtime/fireredlid/verify_labels.py \
+  --model-dir FireRedLID \
+  --manifest /path/to/representative-lid.jsonl \
+  --candidate-backend compile \
+  --confidence-atol 0.005 \
+  --report runtime/fireredlid/artifacts/rtx-pro-5000/verify.labels.compile.json
+
+uv run python runtime/fireredlid/verify_labels.py \
+  --model-dir FireRedLID \
+  --manifest /path/to/representative-lid.jsonl \
+  --candidate-backend tensorrt \
+  --engine-dir runtime/fireredlid/artifacts/rtx-pro-5000/engine \
+  --confidence-atol 0.005 \
+  --report runtime/fireredlid/artifacts/rtx-pro-5000/engine/verify.labels.tensorrt.json
 ```
 
 The engine directory must contain:
