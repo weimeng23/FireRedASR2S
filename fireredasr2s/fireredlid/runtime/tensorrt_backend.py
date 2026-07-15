@@ -19,6 +19,58 @@ class BackendUnavailableError(RuntimeError):
     pass
 
 
+def _configure_context(
+    context,
+    profile_index,
+    active_profile,
+    feature_shape,
+    lengths_shape,
+    stream_handle,
+) -> tuple[int, dict[str, tuple[int, ...]]]:
+    if profile_index != active_profile:
+        if not context.set_optimization_profile_async(
+            profile_index,
+            stream_handle,
+        ):
+            raise RuntimeError(
+                f"failed to select TensorRT profile {profile_index}"
+            )
+        active_profile = profile_index
+    if context.set_input_shape("features", feature_shape) is False:
+        raise RuntimeError(
+            f"TensorRT rejected feature shape {feature_shape}"
+        )
+    if context.set_input_shape("feature_lengths", lengths_shape) is False:
+        raise RuntimeError(
+            f"TensorRT rejected lengths shape {lengths_shape}"
+        )
+    output_shapes = {
+        name: tuple(context.get_tensor_shape(name))
+        for name in (
+            "encoder_outputs",
+            "encoder_lengths",
+            "encoder_mask",
+        )
+    }
+    if any(
+        dimension < 0
+        for shape in output_shapes.values()
+        for dimension in shape
+    ):
+        raise RuntimeError("TensorRT output shape remains dynamic")
+    return active_profile, output_shapes
+
+
+def _bind_and_execute(context, tensors, stream_handle) -> None:
+    for name, tensor in tensors.items():
+        if context.set_tensor_address(name, tensor.data_ptr()) is False:
+            raise RuntimeError(
+                f"TensorRT rejected tensor address for {name}"
+            )
+    if not context.execute_async_v3(stream_handle):
+        raise RuntimeError("TensorRT encoder execution failed")
+
+
 def sha256_file(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as source:
@@ -215,7 +267,7 @@ class TensorRTEncoderBackend(EncoderBackend):
                 "failed to create TensorRT execution context"
             )
         self._validate_engine_contract()
-        self._active_profile = 0
+        self._active_profile = -1
 
     @property
     def max_batch(self):
@@ -259,58 +311,27 @@ class TensorRTEncoderBackend(EncoderBackend):
             dtype=torch.int64,
         ).contiguous()
         stream = torch.cuda.current_stream()
-        if profile_index != self._active_profile:
-            if not self.context.set_optimization_profile_async(
-                profile_index,
-                stream.cuda_stream,
-            ):
-                raise RuntimeError(
-                    f"failed to select TensorRT profile {profile_index}"
-                )
-            self._active_profile = profile_index
-        if self.context.set_input_shape("features", shape) is False:
-            raise RuntimeError(f"TensorRT rejected feature shape {shape}")
         lengths_shape = tuple(feature_lengths.shape)
-        if (
-            self.context.set_input_shape(
-                "feature_lengths", lengths_shape
-            )
-            is False
-        ):
-            raise RuntimeError(
-                f"TensorRT rejected lengths shape {lengths_shape}"
-            )
-        output_shape = tuple(
-            self.context.get_tensor_shape("encoder_outputs")
+        self._active_profile, output_shapes = _configure_context(
+            self.context,
+            profile_index,
+            self._active_profile,
+            shape,
+            lengths_shape,
+            stream.cuda_stream,
         )
-        output_lengths_shape = tuple(
-            self.context.get_tensor_shape("encoder_lengths")
-        )
-        mask_shape = tuple(
-            self.context.get_tensor_shape("encoder_mask")
-        )
-        if any(
-            dimension < 0
-            for output in (
-                output_shape,
-                output_lengths_shape,
-                mask_shape,
-            )
-            for dimension in output
-        ):
-            raise RuntimeError("TensorRT output shape remains dynamic")
         outputs = torch.empty(
-            output_shape,
+            output_shapes["encoder_outputs"],
             device="cuda",
             dtype=torch.float16,
         )
         lengths = torch.empty(
-            output_lengths_shape,
+            output_shapes["encoder_lengths"],
             device="cuda",
             dtype=torch.int64,
         )
         mask = torch.empty(
-            mask_shape,
+            output_shapes["encoder_mask"],
             device="cuda",
             dtype=torch.uint8,
         )
@@ -321,10 +342,7 @@ class TensorRTEncoderBackend(EncoderBackend):
             "encoder_lengths": lengths,
             "encoder_mask": mask,
         }
-        for name, tensor in tensors.items():
-            self.context.set_tensor_address(name, tensor.data_ptr())
-        if not self.context.execute_async_v3(stream.cuda_stream):
-            raise RuntimeError("TensorRT encoder execution failed")
+        _bind_and_execute(self.context, tensors, stream.cuda_stream)
         return EncoderResult(
             outputs=outputs,
             lengths=lengths,

@@ -16,6 +16,8 @@ from fireredasr2s.fireredlid.runtime.tensorrt_backend import (
     BackendUnavailableError,
     EngineManifest,
     TensorRTEncoderBackend,
+    _bind_and_execute,
+    _configure_context,
 )
 
 
@@ -192,6 +194,195 @@ profiles:
         encoding="utf-8",
     )
     return onnx_path, checkpoint, profiles
+
+
+class FakeContext:
+    def __init__(
+        self,
+        *,
+        rejected_shape=None,
+        output_shapes=None,
+        profile_switch_success=True,
+        rejected_address=None,
+        execute_success=True,
+    ):
+        self.rejected_shape = rejected_shape
+        self.output_shapes = output_shapes or {
+            "encoder_outputs": (2, 250, 512),
+            "encoder_lengths": (2,),
+            "encoder_mask": (2, 1, 250),
+        }
+        self.profile_switch_success = profile_switch_success
+        self.rejected_address = rejected_address
+        self.execute_success = execute_success
+        self.profile_calls = []
+        self.shape_calls = []
+        self.address_calls = []
+        self.execute_calls = []
+
+    def set_optimization_profile_async(self, profile_index, stream_handle):
+        self.profile_calls.append((profile_index, stream_handle))
+        return self.profile_switch_success
+
+    def set_input_shape(self, name, shape):
+        self.shape_calls.append((name, shape))
+        return name != self.rejected_shape
+
+    def get_tensor_shape(self, name):
+        return self.output_shapes[name]
+
+    def set_tensor_address(self, name, address):
+        self.address_calls.append((name, address))
+        return name != self.rejected_address
+
+    def execute_async_v3(self, stream_handle):
+        self.execute_calls.append(stream_handle)
+        return self.execute_success
+
+
+class FakeTensor:
+    def __init__(self, address):
+        self.address = address
+
+    def data_ptr(self):
+        return self.address
+
+
+def fake_tensors_with_addresses():
+    return {
+        "features": FakeTensor(1),
+        "feature_lengths": FakeTensor(2),
+        "encoder_outputs": FakeTensor(3),
+        "encoder_lengths": FakeTensor(4),
+        "encoder_mask": FakeTensor(5),
+    }
+
+
+def test_context_selects_profile_zero_explicitly():
+    context = FakeContext()
+
+    active, shapes = _configure_context(
+        context,
+        profile_index=0,
+        active_profile=-1,
+        feature_shape=(2, 1000, 80),
+        lengths_shape=(2,),
+        stream_handle=123,
+    )
+
+    assert context.profile_calls == [(0, 123)]
+    assert active == 0
+    assert shapes["encoder_outputs"] == (2, 250, 512)
+
+
+def test_context_keeps_the_active_profile_without_switching():
+    context = FakeContext()
+
+    active, _ = _configure_context(
+        context,
+        profile_index=0,
+        active_profile=0,
+        feature_shape=(2, 1000, 80),
+        lengths_shape=(2,),
+        stream_handle=123,
+    )
+
+    assert context.profile_calls == []
+    assert active == 0
+
+
+def test_context_reports_profile_switch_failure():
+    context = FakeContext(profile_switch_success=False)
+
+    with pytest.raises(RuntimeError, match="TensorRT profile 1"):
+        _configure_context(
+            context,
+            profile_index=1,
+            active_profile=0,
+            feature_shape=(2, 1000, 80),
+            lengths_shape=(2,),
+            stream_handle=123,
+        )
+
+    assert context.shape_calls == []
+
+
+@pytest.mark.parametrize(
+    ("rejected_shape", "message"),
+    [
+        ("features", "feature shape"),
+        ("feature_lengths", "lengths shape"),
+    ],
+)
+def test_context_reports_rejected_input_shape(rejected_shape, message):
+    context = FakeContext(rejected_shape=rejected_shape)
+
+    with pytest.raises(RuntimeError, match=message):
+        _configure_context(
+            context,
+            profile_index=0,
+            active_profile=0,
+            feature_shape=(2, 1000, 80),
+            lengths_shape=(2,),
+            stream_handle=123,
+        )
+
+
+@pytest.mark.parametrize(
+    "output_name",
+    ["encoder_outputs", "encoder_lengths", "encoder_mask"],
+)
+def test_context_rejects_unresolved_output_shape(output_name):
+    output_shapes = {
+        "encoder_outputs": (2, 250, 512),
+        "encoder_lengths": (2,),
+        "encoder_mask": (2, 1, 250),
+    }
+    output_shapes[output_name] = (-1,)
+    context = FakeContext(output_shapes=output_shapes)
+
+    with pytest.raises(RuntimeError, match="output shape remains dynamic"):
+        _configure_context(
+            context,
+            profile_index=0,
+            active_profile=0,
+            feature_shape=(2, 1000, 80),
+            lengths_shape=(2,),
+            stream_handle=123,
+        )
+
+
+def test_binding_addresses_and_executes():
+    context = FakeContext()
+    tensors = fake_tensors_with_addresses()
+
+    assert _bind_and_execute(context, tensors, stream_handle=123) is None
+
+    assert context.address_calls == [
+        (name, tensor.data_ptr()) for name, tensor in tensors.items()
+    ]
+    assert context.execute_calls == [123]
+
+
+def test_binding_failure_names_the_tensor():
+    context = FakeContext(rejected_address="encoder_mask")
+    tensors = fake_tensors_with_addresses()
+
+    with pytest.raises(RuntimeError, match="encoder_mask"):
+        _bind_and_execute(context, tensors, stream_handle=123)
+
+    assert context.execute_calls == []
+
+
+def test_execution_failure_is_reported():
+    context = FakeContext(execute_success=False)
+
+    with pytest.raises(RuntimeError, match="encoder execution failed"):
+        _bind_and_execute(
+            context,
+            fake_tensors_with_addresses(),
+            stream_handle=123,
+        )
 
 
 def test_manifest_exposes_max_batch_and_selects_profile(tmp_path):
