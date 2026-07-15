@@ -219,14 +219,19 @@ def write_manifest(
     profile_config,
     checkpoint_path,
     onnx_path,
+    engine_path,
     trt_version,
 ):
     output_dir = Path(output_dir)
+    properties = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    )
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "precision": "float16",
         "checkpoint_sha256": sha256_file(checkpoint_path),
         "onnx_sha256": sha256_onnx_bundle(onnx_path),
+        "engine_sha256": sha256_file(engine_path),
         "input_names": INPUT_NAMES,
         "output_names": OUTPUT_NAMES,
         "tensor_dtypes": {
@@ -238,11 +243,14 @@ def write_manifest(
         },
         "profiles": flatten_profiles(profile_config),
         "environment": {
-            "gpu": torch.cuda.get_device_name(torch.cuda.current_device()),
+            "gpu": properties.name,
+            "compute_capability": (
+                f"{properties.major}.{properties.minor}"
+            ),
             "python": platform.python_version(),
-            "pytorch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "tensorrt": trt_version,
+            "pytorch": str(torch.__version__),
+            "cuda": str(torch.version.cuda),
+            "tensorrt": str(trt_version),
         },
     }
     (output_dir / "manifest.json").write_text(
@@ -304,12 +312,15 @@ def build_engine(onnx_path, output_dir, profile_path, checkpoint_path):
                     f"TensorRT rejected profile {item['name']} input {name}"
                 )
         config.add_optimization_profile(profile)
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.unlink(missing_ok=True)
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
         raise RuntimeError("TensorRT returned an empty serialized engine")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "encoder.plan").write_bytes(bytes(serialized))
+    engine_path = output_dir / "encoder.plan"
+    engine_path.write_bytes(bytes(serialized))
     destination_profile = output_dir / "profiles.yaml"
     if profile_path.resolve() != destination_profile.resolve():
         shutil.copy2(profile_path, destination_profile)
@@ -318,9 +329,10 @@ def build_engine(onnx_path, output_dir, profile_path, checkpoint_path):
         profile_config,
         checkpoint_path,
         onnx_path,
+        engine_path,
         trt.__version__,
     )
-    return output_dir / "encoder.plan"
+    return engine_path
 
 
 def parse_args():

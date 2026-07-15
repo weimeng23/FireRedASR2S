@@ -31,14 +31,17 @@ class EngineManifest:
     precision: str
     checkpoint_sha256: str
     onnx_sha256: str
+    engine_sha256: str
     input_names: tuple[str, ...]
     output_names: tuple[str, ...]
+    tensor_dtypes: dict[str, str]
     profiles: tuple[dict, ...]
+    environment: dict[str, str]
 
     @classmethod
     def load(cls, path):
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        if data.get("schema_version") != 1:
+        if data.get("schema_version") != 2:
             raise ArtifactMismatchError(
                 "unsupported engine manifest schema"
             )
@@ -54,19 +57,45 @@ class EngineManifest:
             raise ArtifactMismatchError("engine output contract mismatch")
         if data.get("precision") != "float16":
             raise ArtifactMismatchError("engine precision must be float16")
-        for name in ("checkpoint_sha256", "onnx_sha256"):
+        for name in (
+            "checkpoint_sha256",
+            "onnx_sha256",
+            "engine_sha256",
+        ):
             value = data.get(name)
             if not isinstance(value, str) or len(value) != 64:
                 raise ArtifactMismatchError(f"invalid {name}")
+        expected_dtypes = {
+            "features": "float16",
+            "feature_lengths": "int64",
+            "encoder_outputs": "float16",
+            "encoder_lengths": "int64",
+            "encoder_mask": "uint8",
+        }
+        if data.get("tensor_dtypes") != expected_dtypes:
+            raise ArtifactMismatchError(
+                "engine tensor dtype contract mismatch"
+            )
         profiles = data.get("profiles")
         if not isinstance(profiles, list) or not profiles:
             raise ArtifactMismatchError("engine profiles must not be empty")
         for profile in profiles:
+            if (
+                not isinstance(profile, dict)
+                or not isinstance(profile.get("name"), str)
+                or not profile["name"].strip()
+            ):
+                raise ArtifactMismatchError("invalid engine profile")
             minimum = profile.get("min")
             optimum = profile.get("opt")
             maximum = profile.get("max")
             if not all(
-                isinstance(shape, list) and len(shape) == 3
+                isinstance(shape, list)
+                and len(shape) == 3
+                and all(
+                    isinstance(dimension, int) and dimension > 0
+                    for dimension in shape
+                )
                 for shape in (minimum, optimum, maximum)
             ):
                 raise ArtifactMismatchError("invalid engine profile shape")
@@ -79,13 +108,31 @@ class EngineManifest:
                 raise ArtifactMismatchError(
                     "engine profile feature dimension must be 80"
                 )
+        environment = data.get("environment")
+        required_environment = (
+            "gpu",
+            "compute_capability",
+            "python",
+            "pytorch",
+            "cuda",
+            "tensorrt",
+        )
+        if not isinstance(environment, dict) or any(
+            not isinstance(environment.get(name), str)
+            or not environment[name].strip()
+            for name in required_environment
+        ):
+            raise ArtifactMismatchError("invalid engine environment metadata")
         return cls(
             precision=data["precision"],
             checkpoint_sha256=data["checkpoint_sha256"],
             onnx_sha256=data["onnx_sha256"],
+            engine_sha256=data["engine_sha256"],
             input_names=tuple(data["input_names"]),
             output_names=tuple(data["output_names"]),
+            tensor_dtypes=dict(data["tensor_dtypes"]),
             profiles=tuple(profiles),
+            environment=dict(environment),
         )
 
     @property
@@ -116,6 +163,13 @@ class EngineManifest:
                 "checkpoint SHA-256 differs from engine manifest"
             )
 
+    def validate_engine(self, engine_path):
+        actual = sha256_file(engine_path)
+        if actual != self.engine_sha256:
+            raise ArtifactMismatchError(
+                "engine SHA-256 differs from engine manifest"
+            )
+
 
 class TensorRTEncoderBackend(EncoderBackend):
     def __init__(self, engine_dir, checkpoint_path=None):
@@ -143,6 +197,7 @@ class TensorRTEncoderBackend(EncoderBackend):
         engine_path = self.engine_dir / "encoder.plan"
         if not engine_path.is_file():
             raise ArtifactMismatchError(f"missing TensorRT engine: {engine_path}")
+        self.manifest.validate_engine(engine_path)
         self.engine = self.runtime.deserialize_cuda_engine(
             engine_path.read_bytes()
         )
