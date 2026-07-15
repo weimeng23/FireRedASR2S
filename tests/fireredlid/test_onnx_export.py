@@ -3,8 +3,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import onnx
 import onnxruntime as ort
 import torch
+from onnx import TensorProto, helper, numpy_helper
 
 
 SCRIPT = Path("runtime/fireredlid/export_encoder_onnx.py")
@@ -75,6 +77,59 @@ def test_export_supports_dynamic_batch_and_time(tmp_path):
             dtype=np.uint8,
         ),
     )
+
+
+def test_external_data_stays_in_data_directory(tmp_path):
+    module = load_export_module()
+    path = tmp_path / "encoder.onnx"
+    data_directory = tmp_path / "data"
+    data_directory.mkdir()
+    staged_path = data_directory / path.name
+    weight = numpy_helper.from_array(
+        np.eye(2, dtype=np.float32),
+        name="weight",
+    )
+    graph = helper.make_graph(
+        [helper.make_node("MatMul", ["features", "weight"], ["outputs"])],
+        "external-data-test",
+        [helper.make_tensor_value_info("features", TensorProto.FLOAT, [None, 2])],
+        [helper.make_tensor_value_info("outputs", TensorProto.FLOAT, [None, 2])],
+        [weight],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 17)],
+    )
+    onnx.save_model(
+        model,
+        staged_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=False,
+        size_threshold=0,
+    )
+    external_model = onnx.load(staged_path, load_external_data=False)
+    location = next(
+        item.value
+        for item in external_model.graph.initializer[0].external_data
+        if item.key == "location"
+    )
+    external_path = data_directory / location
+    assert external_path.is_file()
+    external_inode = external_path.stat().st_ino
+
+    module.finalize_external_data_layout(staged_path, path)
+
+    relocated_model = onnx.load(path, load_external_data=False)
+    relocated_location = next(
+        item.value
+        for item in relocated_model.graph.initializer[0].external_data
+        if item.key == "location"
+    )
+    assert relocated_location == f"data/{location}"
+    assert external_path.is_file()
+    assert external_path.stat().st_ino == external_inode
+    assert not staged_path.exists()
+    onnx.checker.check_model(path)
 
 
 def test_verify_onnx_outputs_checks_all_three_outputs(tmp_path):

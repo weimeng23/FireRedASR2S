@@ -4,6 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import onnx
 import torch
 
 
@@ -23,6 +24,44 @@ class EncoderExportWrapper(torch.nn.Module):
         return self.encoder(features, feature_lengths)
 
 
+def finalize_external_data_layout(staged_path, output_path):
+    staged_path = Path(staged_path)
+    output_path = Path(output_path)
+    try:
+        data_directory = staged_path.parent.relative_to(output_path.parent)
+    except ValueError as exc:
+        raise ValueError(
+            "staged ONNX must be inside the output directory"
+        ) from exc
+    if data_directory == Path(".") or ".." in data_directory.parts:
+        raise ValueError("staged ONNX must be inside a data subdirectory")
+
+    model = onnx.load(staged_path, load_external_data=False)
+    external_locations = set()
+    for tensor in model.graph.initializer:
+        if tensor.data_location != onnx.TensorProto.EXTERNAL:
+            continue
+        for item in tensor.external_data:
+            if item.key != "location":
+                continue
+            source_location = Path(item.value)
+            if source_location.is_absolute() or ".." in source_location.parts:
+                raise ValueError(
+                    f"external data location must be relative: {item.value}"
+                )
+            external_path = staged_path.parent / source_location
+            if not external_path.is_file():
+                raise FileNotFoundError(
+                    f"external data file does not exist: {external_path}"
+                )
+            external_locations.add(source_location)
+            item.value = (data_directory / source_location).as_posix()
+
+    onnx.save_model(model, staged_path)
+    staged_path.replace(output_path)
+    return len(external_locations)
+
+
 def export_encoder(
     encoder,
     output_path,
@@ -32,13 +71,16 @@ def export_encoder(
     wrapper = EncoderExportWrapper(encoder.float().cpu().eval())
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    data_directory = output_path.parent / "data"
+    data_directory.mkdir(parents=True, exist_ok=True)
+    staged_path = data_directory / output_path.name
     torch.onnx.export(
         wrapper,
         (
             sample_features.float().cpu(),
             sample_lengths.long().cpu(),
         ),
-        str(output_path),
+        str(staged_path),
         input_names=["features", "feature_lengths"],
         output_names=[
             "encoder_outputs",
@@ -57,6 +99,7 @@ def export_encoder(
         external_data=True,
         dynamo=False,
     )
+    finalize_external_data_layout(staged_path, output_path)
     return output_path
 
 

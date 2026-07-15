@@ -44,17 +44,20 @@ Export and verify the dynamic ONNX Encoder:
 ```bash
 python3 runtime/fireredlid/export_encoder_onnx.py \
   --model-dir FireRedLID \
-  --output-dir runtime/fireredlid/artifacts
+  --output-dir runtime/fireredlid/artifacts/torch2.10-opset17-fp32
 
 python3 runtime/fireredlid/verify.py \
   --model-dir FireRedLID \
-  --onnx runtime/fireredlid/artifacts/encoder.fp32.onnx \
-  --report runtime/fireredlid/artifacts/verify.fp32.json
+  --onnx runtime/fireredlid/artifacts/torch2.10-opset17-fp32/encoder.fp32.onnx \
+  --report runtime/fireredlid/artifacts/torch2.10-opset17-fp32/verify.fp32.json
 ```
 
 Generated artifacts are ignored by Git. A large exported model may use ONNX
 external-data files, so copy the complete artifact directory rather than only
-`encoder.fp32.onnx`.
+`encoder.fp32.onnx`. External weight files are stored under the artifact's
+`data/` subdirectory. The exporter writes the weights directly into `data/`;
+it only promotes the small main ONNX graph file to the artifact root after
+updating its relative external-data paths.
 
 Run a CPU end-to-end smoke benchmark:
 
@@ -163,7 +166,7 @@ same GPU class and TensorRT/CUDA software stack used for deployment:
 
 ```bash
 python3 runtime/fireredlid/build_engine.py \
-  --onnx runtime/fireredlid/artifacts/encoder.fp32.onnx \
+  --onnx runtime/fireredlid/artifacts/torch2.10-opset17-fp32/encoder.fp32.onnx \
   --checkpoint FireRedLID/model.pth.tar \
   --profiles runtime/fireredlid/profiles.yaml \
   --output-dir runtime/fireredlid/artifacts/engine
