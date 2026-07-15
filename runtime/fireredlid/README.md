@@ -207,6 +207,50 @@ profiles.yaml
 contracts, profiles, environment versions, and checkpoint/ONNX hashes so a
 runtime cannot silently use an incompatible engine.
 
+Run the benchmark matrix separately for latency and throughput on each GPU.
+Keep every GPU/profile pair in a distinct output directory so deterministic
+report names are not overwritten. For example, run latency on RTX PRO 5000:
+
+```bash
+uv run python runtime/fireredlid/run_benchmark_matrix.py \
+  --model-dir FireRedLID \
+  --manifest /path/to/representative-latency.jsonl \
+  --engine-dir runtime/fireredlid/artifacts/engine \
+  --profile latency \
+  --output-dir runtime/fireredlid/artifacts/rtx-pro-5000/latency \
+  --execute
+```
+
+Then run throughput with its representative heterogeneous manifest and a
+different directory:
+
+```bash
+uv run python runtime/fireredlid/run_benchmark_matrix.py \
+  --model-dir FireRedLID \
+  --manifest /path/to/representative-throughput.jsonl \
+  --engine-dir runtime/fireredlid/artifacts/engine \
+  --profile throughput \
+  --output-dir runtime/fireredlid/artifacts/rtx-pro-5000/throughput \
+  --execute
+```
+
+Repeat both commands on L20 with an engine built on that GPU and output paths
+under `artifacts/l20/`. Each invocation runs eager, compile, and TensorRT for
+the `encoder`, `model`, and `end-to-end` scopes. Latency fixes logical batch
+size 1, no bucketing, five warm-ups, and 50 measured iterations. Throughput
+fixes logical batch size 100, automatic batching, three warm-ups, and 20
+measured iterations.
+
+Without `--execute`, the runner only prints nine shell-escaped commands. The
+default matrix includes TensorRT, so `--engine-dir` is still required for a
+dry-run, but that directory need not exist yet. Execution validates the model
+directory, manifest file, and TensorRT engine directory before launching any
+command. It stops on the first non-zero return code and records attempted
+commands in `<output-dir>/matrix.index.json`. The index includes each command's
+argument list, output path, and return code plus the environment and Git commit
+hash; successful benchmark processes write one
+`benchmark.<backend>.<profile>.<scope>.json` report each.
+
 Run eager FP16, compile FP16, and TensorRT FP16 with identical benchmark inputs
 and parameters. Collect separate reports for `--scope encoder`, `--scope model`,
 and `--scope end-to-end`, and for both `--profile latency` and
