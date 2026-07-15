@@ -697,12 +697,13 @@ iteration settings. The logical batch may be 100 even when the engine physical
 maximum is 4; the planner splits it into physical sub-batches. Tune the engine
 maximum only after recording memory and latency/throughput on each target GPU.
 
-Repeat the build and both matrix invocations on L20 using
-`runtime/fireredlid/artifacts/l20/engine`, with report directories
-`runtime/fireredlid/artifacts/l20/latency` and
-`runtime/fireredlid/artifacts/l20/throughput`. Each successful matrix writes
-nine benchmark JSON files and `matrix.index.json`. Return the index and reports
-for review; a Mac dry-run is command-generation evidence only.
+Repeat the entire preflight, build, Encoder verification, compile/TensorRT
+label-parity, and both matrix blocks on L20. Replace every `rtx-pro-5000`
+artifact or report path above with `l20`, including the preflight report,
+engine directory, label reports, and latency/throughput matrix directories.
+Each successful matrix writes nine benchmark JSON files and
+`matrix.index.json`. Return the index and reports for review; a Mac dry-run is
+command-generation evidence only.
 
 ## Key cautions for the next agent
 

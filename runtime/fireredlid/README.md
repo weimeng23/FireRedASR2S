@@ -256,14 +256,14 @@ uv run python runtime/fireredlid/run_benchmark_matrix.py \
   --execute
 ```
 
-Repeat the build, verification, latency, and throughput commands on L20 with
-`--engine-dir runtime/fireredlid/artifacts/l20/engine` (and the matching build
-`--output-dir`). Keep its reports under `artifacts/l20/latency` and
-`artifacts/l20/throughput`. Each matrix invocation runs eager, compile, and
-TensorRT for the `encoder`, `model`, and `end-to-end` scopes. Latency fixes
-logical batch size 1, no bucketing, five warm-ups, and 50 measured iterations.
-Throughput fixes logical batch size 100, automatic batching, three warm-ups,
-and 20 measured iterations.
+Repeat the entire preflight, build, Encoder verification, compile/TensorRT
+label-parity, latency, and throughput block on L20. Replace every
+`rtx-pro-5000` artifact or report path above with `l20`, including the preflight
+report, engine directory, label reports, and both matrix output directories.
+Each matrix invocation runs eager, compile, and TensorRT for the `encoder`,
+`model`, and `end-to-end` scopes. Latency fixes logical batch size 1, no
+bucketing, five warm-ups, and 50 measured iterations. Throughput fixes logical
+batch size 100, automatic batching, three warm-ups, and 20 measured iterations.
 
 Without `--execute`, the runner only prints nine shell-escaped commands. The
 default matrix includes TensorRT, so `--engine-dir` is still required for a
