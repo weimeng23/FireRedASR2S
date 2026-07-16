@@ -10,9 +10,11 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = [
-    "torch~=2.10.0",
-    "torchaudio~=2.10.0",
-    "transformers~=5.1.0",
+    "torch==2.10.0",
+    "torchaudio==2.10.0",
+    "transformers==5.1.0",
+    "fastapi==0.139.0",
+    "uvicorn[standard]==0.51.0",
     "numpy>=2.4.2,<3.0.0",
     "cn2an>=0.5.23",
     "kaldiio>=2.18.1",
@@ -32,5 +34,15 @@ fireredasr2s-cli = "fireredasr2s.fireredasr2s_cli:cli_main"
 [tool.setuptools.packages.find]
 include = ["fireredasr2s*"]
 
-[tool.uv.pip]
-extra-index-url = ["https://download.pytorch.org/whl/cu118"]
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+torchaudio = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
