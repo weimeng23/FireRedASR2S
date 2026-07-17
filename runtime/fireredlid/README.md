@@ -334,6 +334,16 @@ Check readiness:
 curl http://127.0.0.1:8000/healthz
 ```
 
+Send one 16 kHz mono WAV file to the server. Use `--repeat 3` to separate
+first-request CUDA initialization from steady-state latency:
+
+```bash
+uv run python runtime/fireredlid/client.py /path/to/test.wav \
+  --url http://127.0.0.1:8000/v1/lid \
+  --uttid test \
+  --repeat 3
+```
+
 Create a JSON request and run inference:
 
 ```bash
