@@ -26,10 +26,12 @@ dependencies = [
     "onnxruntime>=1.27.0",
     "PyYAML>=6.0.2",
     "pytest>=9.1.1",
+    "httpx2==2.7.0",
 ]
 
 [project.scripts]
 fireredasr2s-cli = "fireredasr2s.fireredasr2s_cli:cli_main"
+fireredlid-server = "fireredasr2s.fireredlid.server:main"
 
 [tool.setuptools.packages.find]
 include = ["fireredasr2s*"]

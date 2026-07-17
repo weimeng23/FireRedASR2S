@@ -294,3 +294,70 @@ one execution context. Do not call the same instance concurrently. Use one
 instance per service worker or serialize access. A Triton deployment should use
 multiple model instances for concurrency rather than sharing one TensorRT
 context across requests.
+
+## FastAPI server
+
+The FastAPI process loads one model instance and serializes calls to that
+instance. It accepts one or more 16 kHz mono WAV files as base64 strings in a
+single logical batch. It does not combine separate HTTP requests into a dynamic
+batch. Audio longer than `--max-audio-seconds`, oversized encoded audio, and
+oversized request bodies with a `Content-Length` header are rejected with HTTP
+413 before model inference. Configure the same body-size limit in the reverse
+proxy to cover chunked transfer encoding.
+
+Start the eager backend on GPU:
+
+```bash
+uv run fireredlid-server \
+  --model-dir FireRedLID \
+  --backend eager \
+  --use-gpu \
+  --port 8000
+```
+
+For CPU development, replace `--use-gpu` with `--no-use-gpu`. Start compile by
+using `--backend compile`. Start TensorRT with the required FP16 and engine
+arguments:
+
+```bash
+uv run fireredlid-server \
+  --model-dir FireRedLID \
+  --backend tensorrt \
+  --use-gpu \
+  --use-half \
+  --engine-dir runtime/fireredlid/artifacts/l20/engine
+```
+
+Check readiness:
+
+```bash
+curl http://127.0.0.1:8000/healthz
+```
+
+Create a JSON request and run inference:
+
+```bash
+uv run python - <<'PY'
+import base64
+import json
+
+with open("assets/hello_en.wav", "rb") as source:
+    audio = base64.b64encode(source.read()).decode("ascii")
+
+with open("/tmp/lid-request.json", "w") as output:
+    json.dump(
+        {"inputs": [{"uttid": "hello-en", "audio_base64": audio}]},
+        output,
+    )
+PY
+
+curl -X POST http://127.0.0.1:8000/v1/lid \
+  -H 'content-type: application/json' \
+  --data-binary @/tmp/lid-request.json
+```
+
+The server intentionally starts one Uvicorn worker. Starting multiple workers
+would load multiple model copies and consume GPU memory independently.
+Requests wait on an asynchronous single-inference gate before entering the
+worker thread pool, so queued inference does not consume all worker threads or
+delay `/healthz`.
