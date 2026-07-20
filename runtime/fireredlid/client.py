@@ -43,16 +43,22 @@ def send_request(
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description="Send a WAV file to the FireRedLID FastAPI server",
     )
     parser.add_argument("audio", help="path to a 16 kHz mono WAV file")
     parser.add_argument(
         "--url",
         default="http://127.0.0.1:8000/v1/lid",
+        help="FireRedLID server endpoint",
     )
-    parser.add_argument("--uttid")
-    parser.add_argument("--repeat", type=int, default=1)
-    parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--uttid", help="utterance id (defaults to file stem)")
+    parser.add_argument(
+        "--repeat", type=int, default=1, help="number of requests to send"
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=300.0, help="per-request timeout in seconds"
+    )
     args = parser.parse_args(argv)
     if args.repeat <= 0:
         parser.error("--repeat must be positive")
