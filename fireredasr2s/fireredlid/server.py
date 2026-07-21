@@ -53,6 +53,10 @@ class ServerSettings:
         per_item_json_bytes = encoded_audio_bytes + 1024
         return self.max_request_batch_size * per_item_json_bytes + 1024
 
+    @property
+    def dtype(self):
+        return "float16" if self.use_half else "float32"
+
 
 class LidInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -237,6 +241,7 @@ def create_app(
         return {
             "status": "ok",
             "backend": request.app.state.lid_service.active_backend,
+            "dtype": settings.dtype,
         }
 
     @app.post("/v1/lid")
@@ -270,6 +275,7 @@ def create_app(
             ) from error
         return {
             "backend": service.active_backend,
+            "dtype": settings.dtype,
             "results": results,
         }
 
