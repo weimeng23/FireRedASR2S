@@ -245,15 +245,27 @@ class LidBatchScheduler:
                 logger.exception("FireRedLID scheduler worker failed")
                 self._fatal_error = error
                 self._stopping = True
+                closed_error = SchedulerClosedError(
+                    "inference scheduler worker failed"
+                )
+                closed_error.__cause__ = error
                 failed_tasks = list(tasks or ())
                 failed_tasks.extend(self._pending)
                 self._pending = []
-                self._set_task_errors(failed_tasks, error)
+                self._set_task_errors(failed_tasks, closed_error)
                 return
 
     async def _execute_tasks(self, loop, tasks):
         remaining_tasks = list(tasks)
         while remaining_tasks:
+            if self._stopping:
+                self._set_task_errors(
+                    remaining_tasks,
+                    SchedulerClosedError(
+                        "inference scheduler is stopping"
+                    ),
+                )
+                return
             inference_ids = [
                 f"lid-inference-{next(self._inference_ids)}"
                 for _ in remaining_tasks

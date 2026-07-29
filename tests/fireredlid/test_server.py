@@ -467,6 +467,38 @@ def test_scheduler_closed_maps_to_http_503():
     assert response.status_code == 503
 
 
+def test_scheduler_worker_fatal_maps_current_request_to_http_503(
+    monkeypatch,
+):
+    class FatalScheduler(server_module.LidBatchScheduler):
+        async def _next_batch(self):
+            await self._wake.wait()
+            raise ValueError("secret scheduler failure")
+
+    monkeypatch.setattr(
+        server_module,
+        "LidBatchScheduler",
+        FatalScheduler,
+    )
+    app = create_app(
+        ServerSettings(model_dir="/model", use_gpu=False),
+        model_loader=lambda *_: FakeLid(),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/lid",
+            json={
+                "inputs": [
+                    {"uttid": "one", "audio_base64": encode_wav()}
+                ]
+            },
+        )
+
+    assert response.status_code == 503
+    assert "secret scheduler failure" not in response.text
+
+
 def test_model_load_and_inference_use_the_same_dedicated_thread():
     thread_ids = {}
 

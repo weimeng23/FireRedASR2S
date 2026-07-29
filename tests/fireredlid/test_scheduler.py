@@ -353,6 +353,61 @@ def test_scheduler_keeps_shrinking_when_bad_indices_arrive_in_stages():
     assert isinstance(outcomes[3], FloatingPointError)
 
 
+def test_scheduler_stops_before_retrying_remaining_isolation_tasks():
+    class BlockingPoisonEngine(RecordingEngine):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def process(self, uttids, wav_inputs):
+            self.calls.append(list(uttids))
+            self.entered.set()
+            assert self.release.wait(timeout=1)
+            error = FloatingPointError("non-finite confidence")
+            error.sample_indices = (0,)
+            raise error
+
+    async def scenario():
+        engine = BlockingPoisonEngine()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            scheduler = LidBatchScheduler(
+                engine=engine,
+                executor=executor,
+                queue_capacity=512,
+                max_batch_delay_ms=0,
+                bucket_policies=(BucketPolicy(60, 3),),
+            )
+            await scheduler.start()
+            futures = scheduler.submit_many(
+                [
+                    decoded("bad-1", 1),
+                    decoded("bad-2", 1),
+                    decoded("bad-3", 1),
+                ]
+            )
+            while not engine.entered.is_set():
+                await asyncio.sleep(0)
+            stop_task = asyncio.create_task(scheduler.stop())
+            await asyncio.sleep(0)
+            engine.release.set()
+            outcomes = await asyncio.gather(
+                *futures,
+                return_exceptions=True,
+            )
+            await stop_task
+        return engine.calls, outcomes
+
+    calls, outcomes = asyncio.run(scenario())
+
+    assert [len(call) for call in calls] == [3]
+    assert isinstance(outcomes[0], FloatingPointError)
+    assert all(
+        isinstance(outcome, SchedulerClosedError)
+        for outcome in outcomes[1:]
+    )
+
+
 def test_scheduler_does_not_retry_when_every_item_is_reported_bad():
     class AllPoisonEngine(RecordingEngine):
         def process(self, uttids, wav_inputs):
@@ -409,8 +464,12 @@ def test_scheduler_fails_closed_when_worker_loop_raises():
             )
             await scheduler.start()
             future = scheduler.submit_many([decoded("bad", 1)])[0]
-            with pytest.raises(ValueError, match="duration bucket"):
+            with pytest.raises(
+                SchedulerClosedError,
+                match="worker failed",
+            ) as raised:
                 await asyncio.wait_for(future, timeout=0.1)
+            assert isinstance(raised.value.__cause__, ValueError)
             assert scheduler.is_healthy is False
             with pytest.raises(SchedulerClosedError):
                 scheduler.submit_many([decoded("later", 1)])
