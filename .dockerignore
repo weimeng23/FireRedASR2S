@@ -24,10 +24,10 @@ uv.lock
 
 # 文档与示例素材：无代码引用
 docs/
-assets/
 examples_infer/
 HANDOFF.md
 **/*.wav
+!assets/*.wav
 
 **/.DS_Store
 **/*.sw[po]
