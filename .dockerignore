@@ -1,0 +1,33 @@
+# 构建上下文为仓库根目录（docker build -f Dockerfile.runtime .）
+# 排除下列内容后上下文从 9.3GB 降至约 660KB
+#
+# 注意：dockerignore 的 * 不跨越 /，需要匹配任意层级时必须写 **/
+
+.git
+.gitignore
+
+# 模型权重与离线构建产物：运行时通过 -v 挂载，不进镜像
+FireRedLID/
+runtime/fireredlid/artifacts/
+**/pretrained_models
+
+# 不纳入版本控制，故一并排除：避免本机构建用本地 lock、CI 现场解析而产生差异
+uv.lock
+
+# 本地环境与缓存：镜像内由 uv sync 重建
+.venv/
+**/*.egg-info
+**/__pycache__
+**/*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# 文档与示例素材：无代码引用
+docs/
+assets/
+examples_infer/
+HANDOFF.md
+**/*.wav
+
+**/.DS_Store
+**/*.sw[po]

@@ -22,11 +22,16 @@ dependencies = [
     "soundfile>=0.13.1",
     "textgrid>=1.6.1",
     "kaldi-native-fbank>=1.22.3",
-    "onnx>=1.22.0",
-    "onnxruntime>=1.27.0",
     "PyYAML>=6.0.2",
+]
+
+# 仅测试与离线构建（ONNX 导出 / TRT engine 构建）需要，运行时镜像用 uv sync --no-dev 排除
+[dependency-groups]
+dev = [
     "pytest>=9.1.1",
     "httpx2==2.7.0",
+    "onnx>=1.22.0",
+    "onnxruntime>=1.27.0",
 ]
 
 [project.scripts]

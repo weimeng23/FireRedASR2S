@@ -11,3 +11,10 @@ pretrained_models/
 /runtime/fireredlid/artifacts/
 *.swp
 *.swo
+uv.lock
+*.egg-info
+/FireRedLID/
+/docs
+Dockerfile.*
+start_docker.sh
+polaris_client.py
