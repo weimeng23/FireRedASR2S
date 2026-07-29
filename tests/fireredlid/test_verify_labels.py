@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from fireredasr2s.fireredlid import lid as lid_module
+
 
 SCRIPT = Path("runtime/fireredlid/verify_labels.py")
 
@@ -170,6 +172,49 @@ def test_compare_results_is_stable_across_input_order():
     assert report["passed"] is False
     assert report["label_mismatches"][0]["uttid"] == "b"
     assert report["confidence_mismatches"][0]["uttid"] == "a"
+
+
+def test_run_backend_keeps_verification_batching_in_the_caller(monkeypatch):
+    module = load_verify_labels_module()
+
+    class FakeModel:
+        active_backend = "tensorrt"
+
+        def __init__(self):
+            self.calls = []
+
+        def process(self, uttids, wavs):
+            self.calls.append((list(uttids), list(wavs)))
+            return [
+                {
+                    "uttid": uttids[0],
+                    "lang": "en",
+                    "confidence": 0.9,
+                }
+            ]
+
+    model = FakeModel()
+    monkeypatch.setattr(
+        lid_module.FireRedLid,
+        "from_pretrained",
+        staticmethod(lambda unused_dir, unused_config: model),
+    )
+
+    results = module.run_backend(
+        [
+            {"uttid": "one", "wav": "one.wav"},
+            {"uttid": "two", "wav": "two.wav"},
+        ],
+        model_dir="/model",
+        backend="tensorrt",
+        engine_dir="/engine",
+    )
+
+    assert model.calls == [
+        (["one"], ["one.wav"]),
+        (["two"], ["two.wav"]),
+    ]
+    assert [result["uttid"] for result in results] == ["one", "two"]
 
 
 @pytest.mark.parametrize("confidence_atol", ["nan", "inf"])

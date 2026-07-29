@@ -100,29 +100,34 @@ def _synchronize_cuda(enabled):
         torch.cuda.synchronize()
 
 
-def _planner(lid):
+def _planner(lid, batch_strategy, max_sub_batch_size):
     from fireredasr2s.fireredlid.runtime.batch_planner import BatchPlanner
 
     limits = [
         value
         for value in (
-            lid.config.max_sub_batch_size,
+            max_sub_batch_size,
             lid.backend_max_batch,
         )
         if value is not None
     ]
     return BatchPlanner(
-        strategy=lid.config.resolved_batch_strategy,
+        strategy=batch_strategy,
         max_sub_batch_size=min(limits) if limits else None,
     )
 
 
-def _plan_report(lid, prepared_groups):
+def _plan_report(
+    lid,
+    prepared_groups,
+    batch_strategy,
+    max_sub_batch_size,
+):
     shapes = []
     valid_frames = 0
     padded_frames = 0
     physical_batches = 0
-    planner = _planner(lid)
+    planner = _planner(lid, batch_strategy, max_sub_batch_size)
     for items in prepared_groups:
         for planned in planner.plan(items):
             batch, frames, feature_dim = planned.padded_features.shape
@@ -145,19 +150,17 @@ def _plan_report(lid, prepared_groups):
     }
 
 
-def _run_encoder(lid, items):
+def _run_encoder(lid, planned):
     outputs = []
-    for planned in _planner(lid).plan(items):
-        with lid._measure_stage("h2d"):
-            features = planned.padded_features
-            lengths = planned.feature_lengths
-            if lid.config.use_gpu:
-                features = features.cuda()
-                lengths = lengths.cuda()
-                if lid.config.use_half:
-                    features = features.half()
-        with lid._measure_stage("encoder"):
-            outputs.append(lid.model.encoder(features, lengths))
+    with lid._measure_stage("h2d"):
+        features = planned.padded_features
+        lengths = planned.feature_lengths
+        if lid.config.use_gpu:
+            features = features.cuda()
+            lengths = lengths.cuda()
+        features = features.to(dtype=lid.encoder_dtype)
+    with lid._measure_stage("encoder"):
+        outputs.append(lid.model.encoder(features, lengths))
     return outputs
 
 
@@ -167,30 +170,35 @@ def _run_workload(
     prepared_groups,
     scope,
     synchronize_cuda,
+    batch_strategy,
+    max_sub_batch_size,
 ):
     latencies = []
     utterances = 0
     audio_seconds = 0.0
-    for records, items in zip(record_groups, prepared_groups):
+    planner = _planner(lid, batch_strategy, max_sub_batch_size)
+    for records, items in zip(record_groups, prepared_groups, strict=True):
         _synchronize_cuda(synchronize_cuda)
         started = time.perf_counter()
-        if scope == "end-to-end":
-            result = lid.process(
-                [record["uttid"] for record in records],
-                [record["wav"] for record in records],
-            )
-            if len(result) != len(records):
-                raise RuntimeError(
-                    "end-to-end inference returned an unexpected result count"
+        for planned in planner.plan(items):
+            if scope == "end-to-end":
+                result = lid.process(
+                    [item.uttid for item in planned.items],
+                    [item.wav_input for item in planned.items],
                 )
-        elif scope == "model":
-            result = lid._infer_items(items)
-            if len(result) != len(items):
-                raise RuntimeError(
-                    "model inference returned an unexpected result count"
-                )
-        else:
-            _run_encoder(lid, items)
+                if len(result) != len(planned.items):
+                    raise RuntimeError(
+                        "end-to-end inference returned an unexpected "
+                        "result count"
+                    )
+            elif scope == "model":
+                result = lid._infer_items(planned.items)
+                if len(result) != len(planned.items):
+                    raise RuntimeError(
+                        "model inference returned an unexpected result count"
+                    )
+            else:
+                _run_encoder(lid, planned)
         _synchronize_cuda(synchronize_cuda)
         latencies.append(time.perf_counter() - started)
         utterances += len(items)
@@ -254,6 +262,10 @@ def parse_args(argv=None):
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--output")
     args = parser.parse_args(argv)
+    if args.batch_strategy is None:
+        args.batch_strategy = (
+            "none" if args.profile == "latency" else "auto"
+        )
     try:
         validate_backend_device_precision(
             [args.backend],
@@ -302,13 +314,12 @@ def main():
 
     config = FireRedLidConfig(
         use_gpu=use_gpu,
-        use_half=resolved_precision == "fp16",
+        encoder_precision=resolved_precision,
+        decoder_precision=resolved_precision,
         backend=args.backend,
         profile=args.profile,
         max_audio_seconds=args.max_audio_seconds,
-        batch_strategy=args.batch_strategy,
         engine_dir=args.engine_dir,
-        max_sub_batch_size=args.max_sub_batch_size,
     )
     lid = FireRedLid.from_pretrained(args.model_dir, config)
     prepared_groups = []
@@ -327,7 +338,12 @@ def main():
     synchronize_cuda = use_gpu
     recorder = StageRecorder(synchronize_cuda=synchronize_cuda)
     lid.stage_recorder = recorder
-    plan_report = _plan_report(lid, prepared_groups)
+    plan_report = _plan_report(
+        lid,
+        prepared_groups,
+        args.batch_strategy,
+        args.max_sub_batch_size,
+    )
 
     first_started = time.perf_counter()
     _run_workload(
@@ -336,6 +352,8 @@ def main():
         prepared_groups,
         args.scope,
         synchronize_cuda,
+        args.batch_strategy,
+        args.max_sub_batch_size,
     )
     first_run_s = time.perf_counter() - first_started
 
@@ -347,6 +365,8 @@ def main():
             prepared_groups,
             args.scope,
             synchronize_cuda,
+            args.batch_strategy,
+            args.max_sub_batch_size,
         )
     warmup_s = time.perf_counter() - warmup_started
 
@@ -364,6 +384,8 @@ def main():
             prepared_groups,
             args.scope,
             synchronize_cuda,
+            args.batch_strategy,
+            args.max_sub_batch_size,
         )
         stable_latencies.extend(latencies)
         total_utterances += utterances

@@ -116,6 +116,8 @@ class KaldifeatFbank:
         self.dither = dither
         opts = knf.FbankOptions()
         opts.frame_opts.dither = dither
+        opts.frame_opts.frame_length_ms = frame_length
+        opts.frame_opts.frame_shift_ms = frame_shift
         opts.mel_opts.num_bins = num_mel_bins
         opts.frame_opts.snip_edges = True
         opts.mel_opts.debug_mel = False

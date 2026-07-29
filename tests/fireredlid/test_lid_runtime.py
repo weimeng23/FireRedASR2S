@@ -32,6 +32,13 @@ class FakeModel:
         ]
 
 
+class TinyPrecisionModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = torch.nn.Linear(2, 2)
+        self.lid_decoder = torch.nn.Linear(2, 2)
+
+
 class RecordingStageRecorder:
     def __init__(self):
         self.names = []
@@ -62,22 +69,84 @@ def make_lid(config):
     lid.model = FakeModel()
     lid.tokenizer = FakeTokenizer()
     lid.config = config
+    lid.encoder_dtype = torch.float32
     lid.backend_max_batch = None
     lid.active_backend = config.backend
     return lid
 
 
-def test_config_resolves_profile_defaults():
-    assert FireRedLidConfig(
-        profile="latency"
-    ).resolved_batch_strategy == "none"
-    assert FireRedLidConfig(
-        profile="throughput"
-    ).resolved_batch_strategy == "auto"
+def test_runtime_config_does_not_expose_batch_scheduling_options():
+    config = FireRedLidConfig()
+
+    assert not hasattr(config, "batch_strategy")
+    assert not hasattr(config, "max_sub_batch_size")
+    assert not hasattr(config, "resolved_batch_strategy")
 
 
-def test_tensorrt_requires_gpu_half_and_engine_dir():
-    with pytest.raises(ValueError, match="use_half=True"):
+def test_model_api_preserves_fp32_defaults():
+    config = FireRedLidConfig()
+
+    assert config.encoder_precision == "fp32"
+    assert config.decoder_precision == "fp32"
+
+
+def test_config_supports_independent_encoder_and_decoder_precision():
+    config = FireRedLidConfig(
+        encoder_precision="bf16",
+        decoder_precision="fp32",
+    )
+
+    assert config.encoder_precision == "bf16"
+    assert config.decoder_precision == "fp32"
+
+
+def test_legacy_use_half_rejects_explicit_model_precision():
+    with pytest.raises(ValueError, match="use_half.*precision"):
+        FireRedLidConfig(
+            use_half=True,
+            encoder_precision="fp16",
+            decoder_precision="fp32",
+        )
+
+
+def test_runtime_casts_encoder_and_decoder_independently():
+    model = TinyPrecisionModel()
+
+    FireRedLid(
+        feat_extractor=object(),
+        model=model,
+        tokenizer=object(),
+        config=FireRedLidConfig(
+            use_gpu=False,
+            encoder_precision="bf16",
+            decoder_precision="fp32",
+        ),
+    )
+
+    assert model.encoder.weight.dtype == torch.bfloat16
+    assert model.lid_decoder.weight.dtype == torch.float32
+
+
+def test_runtime_rejects_bf16_when_cuda_device_does_not_support_it(
+    monkeypatch,
+):
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+
+    with pytest.raises(RuntimeError, match="BF16"):
+        FireRedLid(
+            feat_extractor=object(),
+            model=TinyPrecisionModel(),
+            tokenizer=object(),
+            config=FireRedLidConfig(
+                use_gpu=True,
+                encoder_precision="bf16",
+                decoder_precision="fp32",
+            ),
+        )
+
+
+def test_tensorrt_requires_gpu_fp16_encoder_and_engine_dir():
+    with pytest.raises(ValueError, match="encoder_precision='fp16'"):
         FireRedLidConfig(backend="tensorrt")
 
 
@@ -119,14 +188,12 @@ def test_backend_initialization_falls_back_only_when_requested(monkeypatch):
     assert isinstance(fallback.model.encoder, torch.nn.Identity)
 
 
-def test_infer_items_restores_original_order_after_bucketing():
+def test_infer_items_executes_one_physical_batch_in_input_order():
     lid = make_lid(
         FireRedLidConfig(
             use_gpu=False,
             backend="eager",
             profile="throughput",
-            batch_strategy="bucket",
-            max_sub_batch_size=2,
         )
     )
 
@@ -144,28 +211,28 @@ def test_infer_items_restores_original_order_after_bucketing():
         "utt-2",
     ]
     assert [result["lang"] for result in results] == ["30", "4", "10"]
+    assert lid.model.batch_sizes == [3]
 
 
-def test_engine_max_batch_is_a_hard_upper_bound():
+def test_engine_rejects_batch_over_backend_limit_without_splitting():
     lid = make_lid(
         FireRedLidConfig(
             use_gpu=False,
             backend="eager",
-            batch_strategy="none",
-            max_sub_batch_size=4,
         )
     )
     lid.backend_max_batch = 1
 
-    lid._infer_items(
-        [
-            item(0, 1, 1),
-            item(1, 2, 1),
-            item(2, 3, 1),
-        ]
-    )
+    with pytest.raises(ValueError, match="backend maximum batch size"):
+        lid._infer_items(
+            [
+                item(0, 1, 1),
+                item(1, 2, 1),
+                item(2, 3, 1),
+            ]
+        )
 
-    assert lid.model.batch_sizes == [1, 1, 1]
+    assert lid.model.batch_sizes == []
 
 
 def test_infer_items_records_transfer_and_result_formatting_stages():
@@ -179,7 +246,7 @@ def test_infer_items_records_transfer_and_result_formatting_stages():
     assert "result_formatting" in recorder.names
 
 
-def test_process_records_fbank_stage_for_empty_features():
+def test_process_returns_no_results_for_empty_features():
     class EmptyFeatureExtractor:
         def extract_many(self, *args, **kwargs):
             return []
@@ -192,5 +259,22 @@ def test_process_records_fbank_stage_for_empty_features():
 
     result = lid.process(["empty"], ["empty.wav"])
 
-    assert result == [{"uttid": "empty", "lang": ""}]
+    assert result == []
     assert recorder.names == ["fbank"]
+
+
+def test_process_preserves_model_inference_error():
+    class OneFeatureExtractor:
+        def extract_many(self, *args, **kwargs):
+            return [item(0, 1, 1)]
+
+    class BrokenModel(FakeModel):
+        def process(self, *args, **kwargs):
+            raise RuntimeError("decoder produced NaN")
+
+    lid = make_lid(FireRedLidConfig(use_gpu=False))
+    lid.feat_extractor = OneFeatureExtractor()
+    lid.model = BrokenModel()
+
+    with pytest.raises(RuntimeError, match="decoder produced NaN"):
+        lid.process(["broken"], ["broken.wav"])

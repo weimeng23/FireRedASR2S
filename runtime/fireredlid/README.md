@@ -90,11 +90,11 @@ compile latency mode or the FP16 TensorRT engine on Linux NVIDIA:
 ```python
 config = FireRedLidConfig(
     use_gpu=True,
-    use_half=True,
     backend="tensorrt",
     engine_dir="runtime/fireredlid/artifacts/rtx-pro-5000/engine",
     profile="latency",
-    batch_strategy="none",
+    encoder_precision="fp16",
+    decoder_precision="fp32",
     max_audio_seconds=60.0,
 )
 ```
@@ -125,19 +125,22 @@ same command.
 
 ## Offline throughput configuration
 
-For a heterogeneous logical batch, `auto` planning keeps the batch intact when
-padding waste is small and physically groups inputs only when the estimated
-padding saving reaches 20%. TensorRT's profile still imposes a hard physical
-maximum of batch 4 and 6000 FBank frames in the checked-in initial profile.
+Offline benchmark tooling can still use `auto` planning for a heterogeneous
+logical workload. It keeps a batch intact when padding waste is small and
+groups inputs only when the estimated padding saving reaches 20%. This planning
+belongs to the benchmark caller, not `FireRedLid`: the model runtime receives
+one already formed physical batch and performs one forward pass. TensorRT's
+profile still imposes a hard physical maximum of batch 4 and 6000 FBank frames
+in the checked-in initial profile.
 
 ```python
 config = FireRedLidConfig(
     use_gpu=True,
-    use_half=True,
     backend="tensorrt",
     engine_dir="runtime/fireredlid/artifacts/rtx-pro-5000/engine",
     profile="throughput",
-    batch_strategy="auto",
+    encoder_precision="fp16",
+    decoder_precision="fp32",
     max_audio_seconds=60.0,
 )
 ```
@@ -160,11 +163,10 @@ python3 runtime/fireredlid/benchmark.py \
   --iterations 20
 ```
 
-The Python API accepts any logical batch size. It splits physical batches at
-the smaller of `max_sub_batch_size` and the engine profile's maximum batch. A
-future thin Triton wrapper can let Triton form dynamic logical batches before
-calling this same runtime; the TensorRT engine's physical shape limits still
-apply.
+The Python API does not split or reorder its input batch. A caller that submits
+more than the active backend's physical batch limit receives an error. The
+benchmark command owns its offline batching policy; the FastAPI scheduler
+described below owns online dynamic batching.
 
 ## Linux NVIDIA handoff
 
@@ -289,57 +291,83 @@ work.
 
 ## Concurrency
 
-A `FireRedLid` instance owns mutable feature-extractor state and, for TensorRT,
-one execution context. Do not call the same instance concurrently. Use one
-instance per service worker or serialize access. A Triton deployment should use
-multiple model instances for concurrency rather than sharing one TensorRT
-context across requests.
+A `FireRedLid` instance owns one model and, for TensorRT, one execution context.
+It accepts one physical batch per `process()` call and does not implement
+queuing, duration bucketing, dynamic batching, or concurrent execution. The
+service layer is responsible for those policies and serializes all calls to the
+single model instance.
 
 ## FastAPI server
 
-The FastAPI process loads one model instance and serializes calls to that
-instance. It accepts one or more 16 kHz mono WAV files as base64 strings in a
-single logical batch. It does not combine separate HTTP requests into a dynamic
-batch. Audio longer than `--max-audio-seconds`, oversized encoded audio, and
-oversized request bodies with a `Content-Length` header are rejected with HTTP
-413 before model inference. Configure the same body-size limit in the reverse
-proxy to cover chunked transfer encoding.
+The server uses one Uvicorn process, a configurable audio-decode thread pool
+(default 8), one scheduler coroutine, one GPU inference thread, one model
+instance, and one global pending queue with capacity 512 audio items. Decode and
+model work run outside the asyncio event-loop thread. The scheduler combines
+items from concurrent HTTP requests, groups them by duration, and submits one
+physical batch at a time to `FireRedLid.process()`.
 
-Start the eager backend on GPU:
+The defaults are declared once in `configs/fireredlid_server.yaml`:
+
+- HTTP requests contain at most 32 audio items.
+- The scheduler waits at most 5 ms to fill a batch.
+- Duration buckets are ≤5 s / batch 32, ≤15 s / batch 16,
+  ≤30 s / batch 8, and ≤60 s / batch 4.
+- The encoder uses FP16 and the PyTorch decoder uses FP32.
+- The server listens on `0.0.0.0:12345`.
+
+Start with the checked-in configuration:
 
 ```bash
 uv run fireredlid-server \
-  --model-dir FireRedLID \
-  --backend eager \
-  --use-gpu \
-  --port 8000
+  --config configs/fireredlid_server.yaml \
+  --model-dir FireRedLID
 ```
 
-For CPU development, replace `--use-gpu` with `--no-use-gpu`. Start compile by
-using `--backend compile`. Start TensorRT with the required FP16 and engine
-arguments:
+CLI options override YAML values. For example:
 
 ```bash
 uv run fireredlid-server \
+  --config configs/fireredlid_server.yaml \
+  --model-dir FireRedLID \
+  --backend compile \
+  --encoder-precision bf16 \
+  --decoder-precision fp32
+```
+
+For CPU development, use `--no-use-gpu --encoder-precision fp32
+--decoder-precision fp32`. TensorRT requires a CUDA device, an FP16 encoder
+engine, and its artifact directory. Decoder precision remains independently
+configurable:
+
+```bash
+uv run fireredlid-server \
+  --config configs/fireredlid_server.yaml \
   --model-dir FireRedLID \
   --backend tensorrt \
   --use-gpu \
-  --use-half \
+  --encoder-precision fp16 \
+  --decoder-precision fp32 \
   --engine-dir runtime/fireredlid/artifacts/l20/engine
 ```
 
-Check readiness:
+Configure orchestration probes separately:
 
 ```bash
-curl http://127.0.0.1:8000/healthz
+curl http://127.0.0.1:12345/readyz
+curl http://127.0.0.1:12345/livez
 ```
 
-Send one 16 kHz mono WAV file to the server. Use `--repeat 3` to separate
-first-request CUDA initialization from steady-state latency:
+`/healthz` remains a compatibility alias for `/readyz`. Both readiness and
+liveness return 503 after an unrecoverable scheduler-worker failure. Readiness
+then removes the instance from traffic, while liveness tells the orchestrator
+to restart the process because the scheduler deliberately does not restart
+itself in place.
+
+Send one 16 kHz mono WAV file of at least 25 ms to the server. Use `--repeat 3`
+to separate first-request CUDA initialization from steady-state latency:
 
 ```bash
 uv run python runtime/fireredlid/client.py /path/to/test.wav \
-  --url http://127.0.0.1:8000/v1/lid \
   --uttid test \
   --repeat 3
 ```
@@ -361,13 +389,27 @@ with open("/tmp/lid-request.json", "w") as output:
     )
 PY
 
-curl -X POST http://127.0.0.1:8000/v1/lid \
+curl -X POST http://127.0.0.1:12345/v1/lid \
   -H 'content-type: application/json' \
   --data-binary @/tmp/lid-request.json
 ```
 
-The server intentionally starts one Uvicorn worker. Starting multiple workers
-would load multiple model copies and consume GPU memory independently.
-Requests wait on an asynchronous single-inference gate before entering the
-worker thread pool, so queued inference does not consume all worker threads or
-delay `/healthz`.
+`GET /readyz` and `GET /healthz` return `status`, active `backend`, `dtype`,
+`encoder_dtype`, and `decoder_dtype`. `GET /livez` returns `status`.
+`POST /v1/lid` returns the same precision/backend metadata plus an ordered
+`results` list. Each result contains `uttid`, `lang`, `confidence`, `dur_s`,
+`backend`, `truncated`, `processed_dur_s`, and `rtf`. If individual items fail
+during model inference, successful items remain in `results` and failed items
+appear in `errors` as `{"uttid": "...", "code": "inference_failed"}`. Internal
+exception details are logged but are not returned to clients.
+
+The queue limit is atomic per HTTP request: if all items from a request do not
+fit, none are enqueued and the server returns HTTP 429. Invalid audio returns
+400; audio or request batches over configured limits return 413; scheduler
+shutdown or an unhealthy scheduler returns 503. Per-item model failures return
+HTTP 200 with the `errors` field; a request-level unexpected failure returns a
+generic 500. Configure the same request body-size limit in a reverse proxy to
+cover chunked transfer encoding.
+
+The server intentionally starts exactly one Uvicorn worker. Multiple workers
+would create independent queues and load multiple model copies into GPU memory.

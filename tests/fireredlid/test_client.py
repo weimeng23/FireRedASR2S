@@ -78,6 +78,14 @@ def test_send_request_posts_json_and_measures_client_latency():
     assert latency_s == 0.25
 
 
+def test_client_defaults_to_server_port_12345():
+    module = load_client_module()
+
+    args = module.parse_args(["sample.wav"])
+
+    assert args.url == "http://127.0.0.1:12345/v1/lid"
+
+
 def test_main_repeats_requests_and_prints_each_response(tmp_path, capsys):
     module = load_client_module()
     audio_path = tmp_path / "sample.wav"

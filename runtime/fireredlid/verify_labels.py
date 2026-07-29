@@ -208,12 +208,11 @@ def run_backend(records, model_dir, backend, engine_dir=None):
 
     config = FireRedLidConfig(
         use_gpu=True,
-        use_half=True,
         backend=backend,
         profile="latency",
-        batch_strategy="none",
+        encoder_precision="fp16",
+        decoder_precision="fp16",
         engine_dir=engine_dir,
-        max_sub_batch_size=1,
         fallback_backend=None,
     )
     model = FireRedLid.from_pretrained(model_dir, config)
@@ -223,12 +222,13 @@ def run_backend(records, model_dir, backend, engine_dir=None):
                 f"requested backend {backend!r} initialized as "
                 f"{model.active_backend!r}"
             )
-        raw_results = model.process(
-            [record["uttid"] for record in records],
-            [record["wav"] for record in records],
-        )
-        results = _lightweight_results(raw_results, len(records))
-        del raw_results
+        results = []
+        for record in records:
+            raw_results = model.process(
+                [record["uttid"]],
+                [record["wav"]],
+            )
+            results.extend(_lightweight_results(raw_results, 1))
         return results
     finally:
         del model

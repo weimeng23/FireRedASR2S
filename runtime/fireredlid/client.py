@@ -49,7 +49,7 @@ def parse_args(argv=None):
     parser.add_argument("audio", help="path to a 16 kHz mono WAV file")
     parser.add_argument(
         "--url",
-        default="http://127.0.0.1:8000/v1/lid",
+        default="http://127.0.0.1:12345/v1/lid",
         help="FireRedLID server endpoint",
     )
     parser.add_argument("--uttid", help="utterance id (defaults to file stem)")

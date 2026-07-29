@@ -1,0 +1,34 @@
+server:
+  host: 0.0.0.0
+  port: 12345
+  log_level: info
+  max_request_batch_size: 32
+  queue_capacity: 512
+  decode_workers: 8
+
+scheduler:
+  max_batch_delay_ms: 5
+  buckets:
+    - max_seconds: 5
+      max_batch_size: 32
+    - max_seconds: 15
+      max_batch_size: 16
+    - max_seconds: 30
+      max_batch_size: 8
+    - max_seconds: 60
+      max_batch_size: 4
+
+runtime:
+  backend: eager
+  profile: latency
+  use_gpu: true
+  encoder_precision: fp16
+  decoder_precision: fp32
+  engine_dir: null
+  fallback_backend: null
+
+model:
+  # Required at startup. The container entrypoint supplies --model-dir;
+  # set model_dir here or pass --model-dir when starting without it.
+  # model_dir: /path/to/FireRedLID
+  max_audio_seconds: 60

@@ -3,19 +3,33 @@ import asyncio
 import base64
 import binascii
 import io
+import logging
 import math
-import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import soundfile as sf
+import yaml
 from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .lid import FireRedLid, FireRedLidConfig
+from .scheduler import (
+    BucketPolicy,
+    DecodedLidInput,
+    LidBatchScheduler,
+    QueueFullError,
+    SchedulerClosedError,
+)
+
+
+logger = logging.getLogger(__name__)
+
+MIN_AUDIO_DURATION_S = 0.025
 
 
 @dataclass(frozen=True)
@@ -24,22 +38,124 @@ class ServerSettings:
     backend: str = "eager"
     profile: str = "latency"
     use_gpu: bool = True
-    use_half: bool = False
+    use_half: bool | None = None
     engine_dir: str | None = None
     fallback_backend: str | None = None
-    max_sub_batch_size: int | None = None
     max_audio_seconds: float = 60.0
     max_request_batch_size: int = 32
+    queue_capacity: int = 512
+    decode_workers: int = 8
+    max_batch_delay_ms: float = 5.0
+    bucket_policies: tuple[BucketPolicy, ...] = (
+        BucketPolicy(5.0, 32),
+        BucketPolicy(15.0, 16),
+        BucketPolicy(30.0, 8),
+        BucketPolicy(60.0, 4),
+    )
+    encoder_precision: str | None = None
+    decoder_precision: str | None = None
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = 12345
     log_level: str = "info"
 
     def __post_init__(self):
-        if self.max_request_batch_size <= 0:
+        if self.use_half is not None:
+            if (
+                self.encoder_precision is not None
+                or self.decoder_precision is not None
+            ):
+                raise ValueError(
+                    "use_half conflicts with explicit precision settings"
+                )
+            precision = "fp16" if self.use_half else "fp32"
+            object.__setattr__(self, "encoder_precision", precision)
+            object.__setattr__(self, "decoder_precision", precision)
+        else:
+            object.__setattr__(
+                self,
+                "encoder_precision",
+                self.encoder_precision or "fp16",
+            )
+            object.__setattr__(
+                self,
+                "decoder_precision",
+                self.decoder_precision or "fp32",
+            )
+        if (
+            isinstance(self.max_request_batch_size, bool)
+            or not isinstance(self.max_request_batch_size, int)
+            or self.max_request_batch_size <= 0
+        ):
             raise ValueError("max_request_batch_size must be positive")
-        if self.max_sub_batch_size is not None and self.max_sub_batch_size <= 0:
-            raise ValueError("max_sub_batch_size must be positive")
-        if not 1 <= self.port <= 65535:
+        if (
+            isinstance(self.queue_capacity, bool)
+            or not isinstance(self.queue_capacity, int)
+            or self.queue_capacity <= 0
+        ):
+            raise ValueError("queue_capacity must be positive")
+        if self.queue_capacity < self.max_request_batch_size:
+            raise ValueError(
+                "queue_capacity must be at least max_request_batch_size"
+            )
+        if (
+            isinstance(self.decode_workers, bool)
+            or not isinstance(self.decode_workers, int)
+            or self.decode_workers <= 0
+        ):
+            raise ValueError("decode_workers must be positive")
+        if (
+            isinstance(self.max_batch_delay_ms, bool)
+            or not isinstance(self.max_batch_delay_ms, (int, float))
+            or not math.isfinite(self.max_batch_delay_ms)
+            or self.max_batch_delay_ms < 0
+        ):
+            raise ValueError("max_batch_delay_ms must not be negative")
+        if self.encoder_precision not in {"fp32", "fp16", "bf16"}:
+            raise ValueError("unsupported encoder_precision")
+        if self.decoder_precision not in {"fp32", "fp16", "bf16"}:
+            raise ValueError("unsupported decoder_precision")
+        if (
+            isinstance(self.max_audio_seconds, bool)
+            or not isinstance(self.max_audio_seconds, (int, float))
+            or not math.isfinite(self.max_audio_seconds)
+            or self.max_audio_seconds <= 0
+        ):
+            raise ValueError("max_audio_seconds must be positive")
+        boundaries = [
+            policy.max_seconds for policy in self.bucket_policies
+        ]
+        if (
+            not boundaries
+            or any(
+                isinstance(policy.max_seconds, bool)
+                or not isinstance(policy.max_seconds, (int, float))
+                or not math.isfinite(policy.max_seconds)
+                or policy.max_seconds <= 0
+                or isinstance(policy.max_batch_size, bool)
+                or not isinstance(policy.max_batch_size, int)
+                or policy.max_batch_size <= 0
+                for policy in self.bucket_policies
+            )
+            or any(
+                current <= previous
+                for previous, current in zip(
+                    boundaries,
+                    boundaries[1:],
+                )
+            )
+        ):
+            raise ValueError(
+                "bucket_policies must be positive and strictly ordered"
+            )
+        if boundaries[-1] < self.max_audio_seconds:
+            raise ValueError(
+                "bucket_policies must cover max_audio_seconds"
+            )
+        if (
+            isinstance(self.port, bool)
+            or not isinstance(self.port, int)
+            or not 1 <= self.port <= 65535
+        ):
             raise ValueError("port must be between 1 and 65535")
 
     @property
@@ -55,7 +171,29 @@ class ServerSettings:
 
     @property
     def dtype(self):
-        return "float16" if self.use_half else "float32"
+        if self.encoder_precision == self.decoder_precision:
+            return {
+                "fp32": "float32",
+                "fp16": "float16",
+                "bf16": "bfloat16",
+            }[self.encoder_precision]
+        return "mixed"
+
+    @property
+    def encoder_dtype(self):
+        return {
+            "fp32": "float32",
+            "fp16": "float16",
+            "bf16": "bfloat16",
+        }[self.encoder_precision]
+
+    @property
+    def decoder_dtype(self):
+        return {
+            "fp32": "float32",
+            "fp16": "float16",
+            "bf16": "bfloat16",
+        }[self.decoder_precision]
 
 
 class LidInput(BaseModel):
@@ -80,10 +218,6 @@ class AudioTooLargeError(ValueError):
 
 
 class RequestBatchTooLarge(ValueError):
-    pass
-
-
-class InferenceResultError(RuntimeError):
     pass
 
 
@@ -144,6 +278,11 @@ def decode_audio(item: LidInput, max_audio_seconds: float):
             f"audio for uttid '{item.uttid}' must not be empty"
         )
     sample_rate = audio_file.samplerate
+    min_samples = math.ceil(sample_rate * MIN_AUDIO_DURATION_S)
+    if waveform.size < min_samples:
+        raise InvalidAudioError(
+            f"audio for uttid '{item.uttid}' must be at least 25 ms"
+        )
     return sample_rate, waveform
 
 
@@ -151,47 +290,112 @@ class LidService:
     def __init__(
         self,
         model,
+        scheduler,
+        decode_executor,
         max_request_batch_size: int,
         max_audio_seconds: float = 60.0,
     ):
         self._model = model
+        self._scheduler = scheduler
+        self._decode_executor = decode_executor
         self._max_request_batch_size = max_request_batch_size
         self._max_audio_seconds = max_audio_seconds
-        self._inference_lock = threading.Lock()
 
     @property
     def active_backend(self):
         return self._model.active_backend
 
-    def predict(self, inputs: list[LidInput]):
+    @property
+    def pending_count(self):
+        return self._scheduler.pending_count
+
+    @property
+    def is_healthy(self):
+        return self._scheduler.is_healthy
+
+    async def predict(self, inputs: list[LidInput]):
         if len(inputs) > self._max_request_batch_size:
             raise RequestBatchTooLarge(
                 "request contains "
                 f"{len(inputs)} inputs; maximum is "
                 f"{self._max_request_batch_size}"
             )
-        wav_inputs = [
-            decode_audio(item, self._max_audio_seconds) for item in inputs
-        ]
-        uttids = [item.uttid for item in inputs]
-        with self._inference_lock:
-            results = self._model.process(uttids, wav_inputs)
-        if len(results) != len(inputs):
-            raise InferenceResultError(
-                "runtime result count does not match request input count"
+        reservation = self._scheduler.reserve(len(inputs))
+        loop = asyncio.get_running_loop()
+        try:
+            decoded_outputs = await asyncio.gather(
+                *[
+                    loop.run_in_executor(
+                        self._decode_executor,
+                        decode_audio,
+                        item,
+                        self._max_audio_seconds,
+                    )
+                    for item in inputs
+                ],
+                return_exceptions=True,
             )
-        return results
+            for output in decoded_outputs:
+                if isinstance(output, BaseException):
+                    raise output
+            decoded = [
+                DecodedLidInput(
+                    uttid=item.uttid,
+                    wav_input=wav_input,
+                    duration_s=wav_input[1].size / wav_input[0],
+                )
+                for item, wav_input in zip(
+                    inputs,
+                    decoded_outputs,
+                    strict=True,
+                )
+            ]
+            futures = self._scheduler.submit_reserved(
+                reservation,
+                decoded,
+            )
+        except BaseException:
+            self._scheduler.release(reservation)
+            raise
+        outcomes = await asyncio.gather(
+            *futures,
+            return_exceptions=True,
+        )
+        results = []
+        errors = []
+        for item, outcome in zip(inputs, outcomes, strict=True):
+            if isinstance(outcome, SchedulerClosedError):
+                raise outcome
+            if isinstance(outcome, BaseException):
+                logger.error(
+                    "FireRedLID item inference failed for uttid=%r",
+                    item.uttid,
+                    exc_info=(
+                        type(outcome),
+                        outcome,
+                        outcome.__traceback__,
+                    ),
+                )
+                errors.append(
+                    {
+                        "uttid": item.uttid,
+                        "code": "inference_failed",
+                    }
+                )
+                continue
+            results.append(outcome)
+        return results, errors
 
 
 def create_lid_config(settings: ServerSettings) -> FireRedLidConfig:
     return FireRedLidConfig(
         use_gpu=settings.use_gpu,
-        use_half=settings.use_half,
+        encoder_precision=settings.encoder_precision,
+        decoder_precision=settings.decoder_precision,
         backend=settings.backend,
         profile=settings.profile,
         max_audio_seconds=settings.max_audio_seconds,
         engine_dir=settings.engine_dir,
-        max_sub_batch_size=settings.max_sub_batch_size,
         fallback_backend=settings.fallback_backend,
         return_diagnostics=True,
     )
@@ -203,18 +407,72 @@ def create_app(
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        config = create_lid_config(settings)
-        model = model_loader(settings.model_dir, config)
-        app.state.lid_service = LidService(
-            model,
-            max_request_batch_size=settings.max_request_batch_size,
-            max_audio_seconds=settings.max_audio_seconds,
+        decode_executor = ThreadPoolExecutor(
+            max_workers=settings.decode_workers,
+            thread_name_prefix="lid-decode",
         )
-        yield
-        del app.state.lid_service
+        gpu_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="lid-gpu",
+        )
+        scheduler = None
+        config = create_lid_config(settings)
+        loop = asyncio.get_running_loop()
+        try:
+            model = await loop.run_in_executor(
+                gpu_executor,
+                model_loader,
+                settings.model_dir,
+                config,
+            )
+            backend_max_batch = getattr(
+                model,
+                "backend_max_batch",
+                None,
+            )
+            if (
+                backend_max_batch is not None
+                and backend_max_batch <= 0
+            ):
+                raise ValueError("backend_max_batch must be positive")
+            bucket_policies = tuple(
+                BucketPolicy(
+                    policy.max_seconds,
+                    min(policy.max_batch_size, backend_max_batch)
+                    if backend_max_batch is not None
+                    else policy.max_batch_size,
+                )
+                for policy in settings.bucket_policies
+            )
+            scheduler = LidBatchScheduler(
+                engine=model,
+                executor=gpu_executor,
+                queue_capacity=settings.queue_capacity,
+                max_batch_delay_ms=settings.max_batch_delay_ms,
+                bucket_policies=bucket_policies,
+            )
+            await scheduler.start()
+            app.state.lid_service = LidService(
+                model,
+                scheduler,
+                decode_executor,
+                max_request_batch_size=settings.max_request_batch_size,
+                max_audio_seconds=settings.max_audio_seconds,
+            )
+            yield
+        finally:
+            try:
+                if scheduler is not None:
+                    await scheduler.stop()
+            finally:
+                if hasattr(app.state, "lid_service"):
+                    del app.state.lid_service
+                try:
+                    decode_executor.shutdown(wait=True)
+                finally:
+                    gpu_executor.shutdown(wait=True)
 
     app = FastAPI(title="FireRedLID Server", lifespan=lifespan)
-    app.state.inference_gate = asyncio.Semaphore(1)
 
     @app.middleware("http")
     async def enforce_request_body_limit(request: Request, call_next):
@@ -236,23 +494,38 @@ def create_app(
                 )
         return await call_next(request)
 
+    @app.get("/livez")
+    async def liveness(request: Request):
+        service = request.app.state.lid_service
+        if not service.is_healthy:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="inference scheduler requires process restart",
+            )
+        return {"status": "ok"}
+
     @app.get("/healthz")
-    async def health(request: Request):
+    @app.get("/readyz")
+    async def readiness(request: Request):
+        service = request.app.state.lid_service
+        if not service.is_healthy:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="inference scheduler is not healthy",
+            )
         return {
             "status": "ok",
-            "backend": request.app.state.lid_service.active_backend,
+            "backend": service.active_backend,
             "dtype": settings.dtype,
+            "encoder_dtype": settings.encoder_dtype,
+            "decoder_dtype": settings.decoder_dtype,
         }
 
     @app.post("/v1/lid")
     async def infer(payload: LidRequest, request: Request):
         service = request.app.state.lid_service
         try:
-            async with request.app.state.inference_gate:
-                results = await run_in_threadpool(
-                    service.predict,
-                    payload.inputs,
-                )
+            results, errors = await service.predict(payload.inputs)
         except InvalidAudioError as error:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -268,69 +541,201 @@ def create_app(
                 status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 detail=str(error),
             ) from error
-        except InferenceResultError as error:
+        except QueueFullError as error:
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail=str(error),
             ) from error
-        return {
+        except SchedulerClosedError as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(error),
+            ) from error
+        except Exception as error:
+            logger.exception("FireRedLID inference failed")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="internal inference error",
+            ) from error
+        response = {
             "backend": service.active_backend,
             "dtype": settings.dtype,
+            "encoder_dtype": settings.encoder_dtype,
+            "decoder_dtype": settings.decoder_dtype,
             "results": results,
         }
+        if errors:
+            response["errors"] = errors
+        return response
 
     return app
 
 
+def _load_yaml_settings(path: str) -> dict:
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("server config must be a YAML mapping")
+    section_keys = {
+        "server": {
+            "host",
+            "port",
+            "log_level",
+            "max_request_batch_size",
+            "queue_capacity",
+            "decode_workers",
+        },
+        "scheduler": {
+            "max_batch_delay_ms",
+            "buckets",
+        },
+        "runtime": {
+            "backend",
+            "profile",
+            "use_gpu",
+            "use_half",
+            "encoder_precision",
+            "decoder_precision",
+            "engine_dir",
+            "fallback_backend",
+        },
+        "model": {
+            "model_dir",
+            "max_audio_seconds",
+        },
+    }
+    unknown_sections = set(data) - set(section_keys)
+    if unknown_sections:
+        name = sorted(unknown_sections)[0]
+        raise ValueError(f"unknown config key: {name}")
+    values = {}
+    for section_name in ("server", "runtime", "model"):
+        section = data.get(section_name, {})
+        if not isinstance(section, dict):
+            raise ValueError(f"{section_name} config must be a mapping")
+        unknown_keys = set(section) - section_keys[section_name]
+        if unknown_keys:
+            key = sorted(unknown_keys)[0]
+            raise ValueError(
+                f"unknown config key: {section_name}.{key}"
+            )
+        values.update(section)
+    scheduler = data.get("scheduler", {})
+    if not isinstance(scheduler, dict):
+        raise ValueError("scheduler config must be a mapping")
+    unknown_keys = set(scheduler) - section_keys["scheduler"]
+    if unknown_keys:
+        key = sorted(unknown_keys)[0]
+        raise ValueError(f"unknown config key: scheduler.{key}")
+    values.update(
+        {
+            key: value
+            for key, value in scheduler.items()
+            if key != "buckets"
+        }
+    )
+    buckets = scheduler.get("buckets")
+    if buckets is not None:
+        if not isinstance(buckets, list):
+            raise ValueError("scheduler buckets must be a list")
+        policies = []
+        for index, bucket in enumerate(buckets):
+            if not isinstance(bucket, dict):
+                raise ValueError(
+                    f"scheduler bucket {index} must be a mapping"
+                )
+            if set(bucket) != {"max_seconds", "max_batch_size"}:
+                raise ValueError(
+                    f"scheduler bucket {index} must contain only "
+                    "max_seconds and max_batch_size"
+                )
+            max_seconds = bucket["max_seconds"]
+            max_batch_size = bucket["max_batch_size"]
+            if (
+                isinstance(max_seconds, bool)
+                or not isinstance(max_seconds, (int, float))
+                or not math.isfinite(max_seconds)
+            ):
+                raise ValueError(
+                    f"scheduler bucket {index} max_seconds "
+                    "must be a finite number"
+                )
+            if (
+                isinstance(max_batch_size, bool)
+                or not isinstance(max_batch_size, int)
+            ):
+                raise ValueError(
+                    f"scheduler bucket {index} max_batch_size "
+                    "must be an integer"
+                )
+            policies.append(
+                BucketPolicy(
+                    max_seconds=float(max_seconds),
+                    max_batch_size=max_batch_size,
+                )
+            )
+        values["bucket_policies"] = tuple(policies)
+    return values
+
+
 def parse_settings(argv=None) -> ServerSettings:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config")
+    config_args, _ = config_parser.parse_known_args(argv)
+    values = (
+        _load_yaml_settings(config_args.config)
+        if config_args.config is not None
+        else {}
+    )
+
     parser = argparse.ArgumentParser(
         description="Serve FireRedLID through FastAPI",
+        argument_default=argparse.SUPPRESS,
     )
-    parser.add_argument("--model-dir", required=True)
+    parser.add_argument("--config")
+    parser.add_argument("--model-dir")
     parser.add_argument(
         "--backend",
         choices=("eager", "compile", "tensorrt"),
-        default="eager",
     )
     parser.add_argument(
         "--profile",
         choices=("latency", "throughput"),
-        default="latency",
     )
     parser.add_argument(
         "--use-gpu",
         action=argparse.BooleanOptionalAction,
-        default=True,
     )
     parser.add_argument(
         "--use-half",
         action=argparse.BooleanOptionalAction,
-        default=False,
+    )
+    parser.add_argument(
+        "--encoder-precision",
+        choices=("fp32", "fp16", "bf16"),
+    )
+    parser.add_argument(
+        "--decoder-precision",
+        choices=("fp32", "fp16", "bf16"),
     )
     parser.add_argument("--engine-dir")
     parser.add_argument("--fallback-backend", choices=("eager",))
-    parser.add_argument("--max-sub-batch-size", type=int)
-    parser.add_argument("--max-audio-seconds", type=float, default=60.0)
-    parser.add_argument("--max-request-batch-size", type=int, default=32)
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--log-level", default="info")
+    parser.add_argument("--max-audio-seconds", type=float)
+    parser.add_argument("--max-request-batch-size", type=int)
+    parser.add_argument("--queue-capacity", type=int)
+    parser.add_argument("--decode-workers", type=int)
+    parser.add_argument("--max-batch-delay-ms", type=float)
+    parser.add_argument("--host")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--log-level")
     args = parser.parse_args(argv)
-    return ServerSettings(
-        model_dir=args.model_dir,
-        backend=args.backend,
-        profile=args.profile,
-        use_gpu=args.use_gpu,
-        use_half=args.use_half,
-        engine_dir=args.engine_dir,
-        fallback_backend=args.fallback_backend,
-        max_sub_batch_size=args.max_sub_batch_size,
-        max_audio_seconds=args.max_audio_seconds,
-        max_request_batch_size=args.max_request_batch_size,
-        host=args.host,
-        port=args.port,
-        log_level=args.log_level,
-    )
+    overrides = vars(args)
+    overrides.pop("config", None)
+    values.update(overrides)
+    if "model_dir" not in values:
+        parser.error("--model-dir is required unless supplied by --config")
+    return ServerSettings(**values)
 
 
 def main(argv=None, server_runner=None):

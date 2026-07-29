@@ -8,6 +8,12 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+class InvalidTokenConfidenceError(FloatingPointError):
+    def __init__(self, message, sample_indices=()):
+        super().__init__(message)
+        self.sample_indices = tuple(sample_indices)
+
+
 class TransformerDecoder(nn.Module):
     def __init__(
             self, sos_id, eos_id, pad_id, odim,
@@ -27,7 +33,7 @@ class TransformerDecoder(nn.Module):
         self.dropout = nn.Dropout(residual_dropout)
 
         self.layer_stack = nn.ModuleList()
-        for l in range(n_layers):
+        for _ in range(n_layers):
             block = DecoderLayer(d_model, n_head, residual_dropout)
             self.layer_stack.append(block)
 
@@ -36,6 +42,39 @@ class TransformerDecoder(nn.Module):
 
         self.tgt_word_prj.weight = self.tgt_word_emb.weight
         self.scale = (d_model ** 0.5)
+
+    @staticmethod
+    def validate_token_confidences(confidences, beam_size=None):
+        finite = torch.isfinite(confidences)
+        if not finite.all():
+            sample_indices = ()
+            if beam_size is not None:
+                invalid_rows = torch.where(
+                    ~finite.reshape(confidences.size(0), -1).all(dim=1)
+                )[0]
+                sample_indices = sorted(
+                    {
+                        int(row) // beam_size
+                        for row in invalid_rows.cpu().tolist()
+                    }
+                )
+            raise InvalidTokenConfidenceError(
+                "decoder produced non-finite token confidence "
+                f"with dtype={confidences.dtype}",
+                sample_indices,
+            )
+        return confidences.clamp(0.0, 1.0)
+
+    @staticmethod
+    def average_token_confidence(confidences, sample_index):
+        if confidences.numel() == 0:
+            raise InvalidTokenConfidenceError(
+                "decoder produced no language token before EOS",
+                (sample_index,),
+            )
+        return TransformerDecoder.validate_token_confidences(
+            confidences.mean()
+        )
 
     def batch_beam_search(self, encoder_outputs, src_masks,
                    beam_size=1, nbest=1, decode_max_len=0,
@@ -81,7 +120,6 @@ class TransformerDecoder(nn.Module):
 
             t_logit = self.tgt_word_prj(dec_output[:, -1])
             t_scores = F.log_softmax(t_logit / softmax_smoothing, dim=-1)
-            t_origin_scores  = t_scores
 
             if eos_penalty != 1.0:
                 t_scores[:, self.eos_id] *= eos_penalty
@@ -111,8 +149,10 @@ class TransformerDecoder(nn.Module):
             confidences = confidences[topB_row_number_in_ys]
             t_confidences = torch.gather(t_topB_scores.view(N, B*B), dim=1, index=topB_score_ids).view(N*B, 1)
             t_confidences = torch.exp(t_confidences)
-            assert torch.all(t_confidences <= 1.0)
-            assert torch.all(t_confidences >= 0.0)
+            t_confidences = self.validate_token_confidences(
+                t_confidences,
+                beam_size=B,
+            )
             confidences = torch.cat((confidences, t_confidences), dim=1)
 
             # Update caches
@@ -142,13 +182,25 @@ class TransformerDecoder(nn.Module):
         nbest_ys_lengths = ys_lengths.view(N*B)[index.view(-1)].view(N, -1)
         nbest_confidences = confidences.view(N*B, -1)[index.view(-1)].view(N, nbest_ids.size(1), -1)
 
+        eos_only_samples = torch.where(
+            (nbest_ys_lengths <= 1).any(dim=1)
+        )[0]
+        if eos_only_samples.numel() > 0:
+            raise InvalidTokenConfidenceError(
+                "decoder produced no language token before EOS",
+                eos_only_samples.cpu().tolist(),
+            )
+
         # result
         nbest_hyps: List[List[Dict[str, Tensor]]] = []
         for n in range(N):
             n_nbest_hyps: List[Dict[str, Tensor]] = []
             for i, score in enumerate(nbest_scores[n]):
                 confidence = nbest_confidences[n, i, 1:nbest_ys_lengths[n, i]]
-                confidence = confidence.mean()
+                confidence = self.average_token_confidence(
+                    confidence,
+                    sample_index=n,
+                )
                 new_hyp = {
                     "yseq": nbest_ys[n, i, 1:nbest_ys_lengths[n, i]],
                     "confidence": confidence

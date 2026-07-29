@@ -46,6 +46,12 @@ class FireRedLidAed(torch.nn.Module):
             else nullcontext()
         )
         with decoder_stage:
+            decoder_parameter = next(
+                self.lid_decoder.parameters(),
+                None,
+            )
+            if decoder_parameter is not None:
+                enc_outputs = enc_outputs.to(decoder_parameter.dtype)
             nbest_hyps = self.lid_decoder.batch_beam_search(
                 enc_outputs, enc_mask,
                 beam_size, nbest, decode_max_len,

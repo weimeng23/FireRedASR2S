@@ -2,9 +2,7 @@
 
 import logging
 import os
-import re
 import time
-import traceback
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 
@@ -13,7 +11,7 @@ import torch
 from .data.feat import FeatExtractor
 from .models.fireredlid_aed import FireRedLidAed
 from .models.param import count_model_parameters
-from .runtime.batch_planner import BatchPlanner
+from .runtime.batch_planner import pad_features
 from .runtime.encoder_backend import CompatibleEncoderAdapter
 from .runtime.pytorch_backend import CompileEncoderBackend
 from .tokenizer.lid_tokenizer import LidTokenizer
@@ -22,16 +20,23 @@ from .tokenizer.lid_tokenizer import LidTokenizer
 logger = logging.getLogger(__name__)
 
 
+PRECISION_DTYPES = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}
+
+
 @dataclass
 class FireRedLidConfig:
     use_gpu: bool = True
-    use_half: bool = False
+    use_half: bool | None = None
+    encoder_precision: str | None = None
+    decoder_precision: str | None = None
     backend: str = "eager"
     profile: str = "latency"
     max_audio_seconds: float = 60.0
-    batch_strategy: str | None = None
     engine_dir: str | None = None
-    max_sub_batch_size: int | None = None
     fallback_backend: str | None = None
     return_diagnostics: bool = False
     beam_size: int = field(init=False, default=3)
@@ -42,6 +47,29 @@ class FireRedLidConfig:
     eos_penalty: float = field(init=False, default=1.0)
 
     def __post_init__(self):
+        if self.use_half is not None:
+            if (
+                self.encoder_precision is not None
+                or self.decoder_precision is not None
+            ):
+                raise ValueError(
+                    "use_half conflicts with explicit precision settings"
+                )
+            precision = "fp16" if self.use_half else "fp32"
+            self.encoder_precision = precision
+            self.decoder_precision = precision
+        else:
+            self.encoder_precision = self.encoder_precision or "fp32"
+            self.decoder_precision = self.decoder_precision or "fp32"
+        valid_precisions = {"fp32", "fp16", "bf16"}
+        if self.encoder_precision not in valid_precisions:
+            raise ValueError(
+                f"unsupported encoder precision: {self.encoder_precision}"
+            )
+        if self.decoder_precision not in valid_precisions:
+            raise ValueError(
+                f"unsupported decoder precision: {self.decoder_precision}"
+            )
         if self.backend not in {"eager", "compile", "tensorrt"}:
             raise ValueError(f"unsupported backend: {self.backend}")
         if self.profile not in {"latency", "throughput"}:
@@ -51,17 +79,15 @@ class FireRedLidConfig:
         if self.fallback_backend not in {None, "eager"}:
             raise ValueError("fallback_backend must be None or 'eager'")
         if self.backend == "tensorrt":
-            if not self.use_gpu or not self.use_half or not self.engine_dir:
+            if (
+                not self.use_gpu
+                or self.encoder_precision != "fp16"
+                or not self.engine_dir
+            ):
                 raise ValueError(
-                    "tensorrt requires use_gpu=True, use_half=True, "
-                    "and engine_dir"
+                    "tensorrt requires use_gpu=True, "
+                    "encoder_precision='fp16', and engine_dir"
                 )
-
-    @property
-    def resolved_batch_strategy(self):
-        if self.batch_strategy is not None:
-            return self.batch_strategy
-        return "none" if self.profile == "latency" else "auto"
 
 
 class FireRedLid:
@@ -99,13 +125,27 @@ class FireRedLid:
         self.config = config
         self.model_path = model_path
         self.stage_recorder = None
-        self._configure_encoder_backend()
+        self.encoder_dtype = PRECISION_DTYPES[
+            self.config.encoder_precision
+        ]
+        self.decoder_dtype = PRECISION_DTYPES[
+            self.config.decoder_precision
+        ]
         if self.config.use_gpu:
-            if self.config.use_half:
-                self.model.half()
+            if (
+                torch.bfloat16
+                in {self.encoder_dtype, self.decoder_dtype}
+                and not torch.cuda.is_bf16_supported()
+            ):
+                raise RuntimeError(
+                    "BF16 is not supported by the selected CUDA device"
+                )
             self.model.cuda()
         else:
             self.model.cpu()
+        self.model.encoder.to(dtype=self.encoder_dtype)
+        self.model.lid_decoder.to(dtype=self.decoder_dtype)
+        self._configure_encoder_backend()
 
     def _configure_encoder_backend(self):
         self.backend_max_batch = None
@@ -148,80 +188,79 @@ class FireRedLid:
         return recorder.measure(name)
 
     def _infer_items(self, items):
-        limits = [
-            value
-            for value in (
-                self.config.max_sub_batch_size,
-                self.backend_max_batch,
+        if (
+            self.backend_max_batch is not None
+            and len(items) > self.backend_max_batch
+        ):
+            raise ValueError(
+                f"batch size {len(items)} exceeds backend maximum batch size "
+                f"{self.backend_max_batch}"
             )
-            if value is not None
-        ]
-        max_batch = min(limits) if limits else None
-        planner = BatchPlanner(
-            strategy=self.config.resolved_batch_strategy,
-            max_sub_batch_size=max_batch,
+        with self._measure_stage("h2d"):
+            features = pad_features([item.feature for item in items])
+            lengths = torch.tensor(
+                [item.feature.size(0) for item in items],
+                dtype=torch.long,
+            )
+            if self.config.use_gpu:
+                features = features.cuda()
+                lengths = lengths.cuda()
+            features = features.to(dtype=self.encoder_dtype)
+        start_time = time.time()
+        process_args = (
+            features,
+            lengths,
+            self.config.beam_size,
+            self.config.nbest,
+            self.config.decode_max_len,
+            self.config.softmax_smoothing,
+            self.config.aed_length_penalty,
+            self.config.eos_penalty,
         )
-        raw_results = {}
-        inference_elapsed = 0.0
-        for planned in planner.plan(items):
-            with self._measure_stage("h2d"):
-                features = planned.padded_features
-                lengths = planned.feature_lengths
-                if self.config.use_gpu:
-                    features = features.cuda()
-                    lengths = lengths.cuda()
-                    if self.config.use_half:
-                        features = features.half()
-            start_time = time.time()
-            process_args = (
-                features,
-                lengths,
-                self.config.beam_size,
-                self.config.nbest,
-                self.config.decode_max_len,
-                self.config.softmax_smoothing,
-                self.config.aed_length_penalty,
-                self.config.eos_penalty,
+        recorder = getattr(self, "stage_recorder", None)
+        if recorder is None:
+            hypotheses = self.model.process(*process_args)
+        else:
+            hypotheses = self.model.process(
+                *process_args,
+                stage_recorder=recorder,
             )
-            recorder = getattr(self, "stage_recorder", None)
-            if recorder is None:
-                hypotheses = self.model.process(*process_args)
-            else:
-                hypotheses = self.model.process(
-                    *process_args,
-                    stage_recorder=recorder,
-                )
-            inference_elapsed += time.time() - start_time
-            with self._measure_stage("result_formatting"):
-                for item, hypotheses_for_item in zip(
-                    planned.items, hypotheses
-                ):
-                    hypothesis = hypotheses_for_item[0]
-                    ids = [
-                        int(token_id)
-                        for token_id in hypothesis["yseq"].cpu()
-                    ]
-                    result = {
-                        "uttid": item.uttid,
-                        "lang": self.tokenizer.detokenize(ids),
-                        "confidence": round(
-                            hypothesis["confidence"].cpu().item(), 3
-                        ),
-                        "dur_s": round(item.duration_s, 3),
-                    }
-                    if isinstance(item.wav_input, str):
-                        result["wav"] = item.wav_input
-                    if self.config.return_diagnostics:
-                        result.update(
-                            {
-                                "backend": self.active_backend,
-                                "truncated": item.truncated,
-                                "processed_dur_s": round(
-                                    item.processed_duration_s, 3
-                                ),
-                            }
-                        )
-                    raw_results[item.index] = result
+        inference_elapsed = time.time() - start_time
+        if len(hypotheses) != len(items):
+            raise RuntimeError(
+                "model result count does not match physical batch size"
+            )
+        raw_results = {}
+        with self._measure_stage("result_formatting"):
+            for item, hypotheses_for_item in zip(
+                items, hypotheses, strict=True
+            ):
+                hypothesis = hypotheses_for_item[0]
+                ids = [
+                    int(token_id)
+                    for token_id in hypothesis["yseq"].cpu()
+                ]
+                result = {
+                    "uttid": item.uttid,
+                    "lang": self.tokenizer.detokenize(ids),
+                    "confidence": round(
+                        hypothesis["confidence"].cpu().item(), 3
+                    ),
+                    "dur_s": round(item.duration_s, 3),
+                }
+                if isinstance(item.wav_input, str):
+                    result["wav"] = item.wav_input
+                if self.config.return_diagnostics:
+                    result.update(
+                        {
+                            "backend": self.active_backend,
+                            "truncated": item.truncated,
+                            "processed_dur_s": round(
+                                item.processed_duration_s, 3
+                            ),
+                        }
+                    )
+                raw_results[item.index] = result
         total_duration = sum(item.duration_s for item in items)
         rtf = (
             inference_elapsed / total_duration
@@ -237,31 +276,15 @@ class FireRedLid:
 
     @torch.no_grad()
     def process(self, batch_uttid, batch_wav_path):
-        batch_uttid_origin = batch_uttid
-        try:
-            with self._measure_stage("fbank"):
-                items = self.feat_extractor.extract_many(
-                    batch_wav_path,
-                    batch_uttid,
-                    max_audio_seconds=self.config.max_audio_seconds,
-                )
-            if not items:
-                return [
-                    {"uttid": uttid, "lang": ""}
-                    for uttid in batch_uttid_origin
-                ]
-        except:
-            traceback.print_exc()
-            return [
-                {"uttid": uttid, "lang": ""}
-                for uttid in batch_uttid_origin
-            ]
-
-        try:
-            return self._infer_items(items)
-        except Exception:
-            traceback.print_exc()
+        with self._measure_stage("fbank"):
+            items = self.feat_extractor.extract_many(
+                batch_wav_path,
+                batch_uttid,
+                max_audio_seconds=self.config.max_audio_seconds,
+            )
+        if not items:
             return []
+        return self._infer_items(items)
 
 
 def load_fireredlid_model(model_path):

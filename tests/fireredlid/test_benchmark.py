@@ -68,6 +68,33 @@ def test_load_manifest_preserves_uttids_and_wave_paths(tmp_path):
     ]
 
 
+@pytest.mark.parametrize(
+    ("profile", "expected_strategy"),
+    [
+        ("latency", "none"),
+        ("throughput", "auto"),
+    ],
+)
+def test_benchmark_defaults_batch_strategy_by_profile(
+    profile,
+    expected_strategy,
+):
+    module = load_benchmark_module()
+
+    args = module.parse_args(
+        [
+            "--model-dir",
+            "model",
+            "--manifest",
+            "input.jsonl",
+            "--profile",
+            profile,
+        ]
+    )
+
+    assert args.batch_strategy == expected_strategy
+
+
 def test_benchmark_report_includes_common_provenance_and_real_input_hashes(
     tmp_path,
     monkeypatch,
@@ -123,7 +150,7 @@ def test_benchmark_report_includes_common_provenance_and_real_input_hashes(
     monkeypatch.setattr(
         module,
         "_plan_report",
-        lambda unused_lid, unused_groups: {
+        lambda unused_lid, unused_groups, unused_strategy, unused_max: {
             "logical_batch_count": 1,
             "physical_batch_count": 1,
             "actual_input_shapes": [[1, 100, 80]],

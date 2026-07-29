@@ -1,7 +1,10 @@
 import numpy as np
 import torch
 
-from fireredasr2s.fireredlid.data.feat import FeatExtractor
+from fireredasr2s.fireredlid.data.feat import (
+    FeatExtractor,
+    KaldifeatFbank,
+)
 
 
 class FakeFbank:
@@ -59,3 +62,10 @@ def test_legacy_call_applies_cmvn_before_zero_padding():
     assert durations == [2.0, 1.0]
     assert uttids == ["first", "second"]
     assert len(wavs) == 2
+
+
+def test_kaldifeat_fbank_applies_configured_frame_geometry():
+    fbank = KaldifeatFbank(frame_length=30, frame_shift=12)
+
+    assert fbank.opts.frame_opts.frame_length_ms == 30
+    assert fbank.opts.frame_opts.frame_shift_ms == 12

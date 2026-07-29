@@ -97,21 +97,23 @@ Important details:
    official algorithms.
 3. Audio is truncated before FBank according to `max_audio_seconds`, defaulting
    to 60 seconds.
-4. A physical batch planner was added:
-   - arbitrary logical request batch sizes are accepted;
+4. A physical batch planner was added for offline benchmark tooling:
+   - arbitrary benchmark workloads can be split outside the model runtime;
    - physical batches are hard-split at the configured/backend maximum;
    - `batch_strategy=none` preserves order without length reordering;
    - `batch_strategy=bucket` groups by processed duration;
    - `batch_strategy=auto` buckets only when estimated padding savings reach
      20%;
-   - results are restored to original request order.
+   - `FireRedLid.process()` itself now receives exactly one physical batch and
+     performs no splitting, bucketing, or dynamic batching.
 5. The Encoder backend abstraction and these implementations were added:
    - eager PyTorch;
    - `torch.compile` PyTorch;
    - TensorRT runtime contract with lazy TensorRT imports and eager fallback
      only when explicitly configured.
 6. The public `FireRedLid` Python API supports backend, profile, maximum audio
-   duration, batch strategy, engine directory and fallback selection.
+   duration, independent Encoder/Decoder precision, engine directory and
+   fallback selection.
 7. Dynamic FP32 ONNX Encoder export and ONNX Runtime verification tooling were
    added.
 8. TensorRT engine builder, manifest, profile loading, checkpoint/ONNX hashing,
@@ -121,7 +123,7 @@ Important details:
    audio-seconds/s, RTF, padding ratio, physical shapes and peak CUDA memory.
 10. Latency and throughput example configurations and the Linux handoff are
     documented in `runtime/fireredlid/README.md`.
-11. The 120-test FireRedLID unit/contract suite covers the mask, feature
+11. The FireRedLID unit/contract suite covers the mask, feature
     truncation, planner, backend adapter, configuration, result ordering, ONNX
     export, verification, benchmark summary, TensorRT artifact validation, and
     benchmark orchestration.
@@ -133,6 +135,11 @@ Important details:
     into eager, compile, and TensorRT commands for Encoder, model, and
     end-to-end scopes. It defaults to a non-executing dry-run, validates all
     required paths before `--execute`, fails fast, and writes a matrix index.
+14. The FastAPI service now owns one capacity-bounded admission queue, duration
+    bucketing and cross-request dynamic batching. It uses eight decode threads,
+    one scheduler coroutine, one dedicated inference thread, one Uvicorn
+    worker, and one model instance by default. Configuration lives in
+    `configs/fireredlid_server.yaml`.
 
 ### Main changed files
 
@@ -140,9 +147,9 @@ Modified official files:
 
 - `fireredasr2s/fireredlid/data/feat.py`: separates extraction from padding,
   truncates before FBank and retains CMVN behavior.
-- `fireredasr2s/fireredlid/lid.py`: extended configuration, logical/physical
-  batch planning, backend selection, fallback, stage timing and original-order
-  restoration.
+- `fireredasr2s/fireredlid/lid.py`: independent Encoder/Decoder precision,
+  single-physical-batch execution, backend selection, fallback and stage
+  timing.
 - `fireredasr2s/fireredlid/models/fireredlid_aed.py`: routes the Encoder through
   the selected backend while preserving all three official Encoder outputs and
   the original Decoder/beam search.
@@ -152,6 +159,7 @@ Modified official files:
 
 New Python runtime modules:
 
+- `fireredasr2s/fireredlid/scheduler.py`
 - `fireredasr2s/fireredlid/runtime/batch_planner.py`
 - `fireredasr2s/fireredlid/runtime/encoder_backend.py`
 - `fireredasr2s/fireredlid/runtime/pytorch_backend.py`
@@ -259,7 +267,7 @@ batching, three warm-ups, and 20 measured iterations.
 This completion is limited to orchestration and Mac-testable contracts. No
 TensorRT engine, CUDA compile result, label-parity result, RTX PRO 5000/L20
 timing, or matrix index from a real Linux GPU run has been produced yet.
-Fresh Mac verification after the final review fixes passed all 120 FireRedLID
+Fresh Mac verification after the final Server review passed all 202 repository
 tests with the four pre-existing legacy ONNX exporter warnings. The exact
 latency dry-run printed nine commands and created no output directory.
 
@@ -403,8 +411,8 @@ been reviewed.
    uses `rtol=2e-2`, `atol=2e-2`; lengths and masks must remain exact.
 6. Compare final labels and confidence against eager FP16 on a representative
    dataset, not only two sample files.
-7. Confirm logical batches larger than engine max batch are split and restored
-   to original order.
+7. Confirm the offline benchmark planner and FastAPI scheduler never submit a
+   physical batch larger than the engine maximum.
 8. Increase max batch independently on each GPU until memory, latency and
    throughput measurements identify the useful limit.
 
@@ -430,9 +438,10 @@ physical batch separately for RTX PRO 5000 and L20.
 The later Triton layer should remain thin:
 
 - Triton dynamically batches requests.
-- The wrapper converts Triton tensors/metadata into this Python runtime's
-  logical batch.
-- The existing planner enforces engine maximum shapes and restores order.
+- The wrapper converts each Triton-formed physical batch into one
+  `FireRedLid.process()` call.
+- Triton configuration enforces the engine maximum shapes; the model runtime
+  does not split or reorder the batch.
 - Use multiple model instances/execution contexts for concurrency; do not call
   one `FireRedLid` instance concurrently.
 
