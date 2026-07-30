@@ -23,6 +23,38 @@ class FeatExtractor:
         sample_rate, wav_np = wav_input
         return sample_rate, wav_np
 
+    def extract_one(
+        self,
+        wav_input,
+        uttid,
+        max_audio_seconds=None,
+        *,
+        index=0,
+    ):
+        sample_rate, wav_np = self._load_waveform(wav_input)
+        duration_s = wav_np.shape[0] / sample_rate
+        max_samples = wav_np.shape[0]
+        if max_audio_seconds is not None:
+            max_samples = min(
+                max_samples, int(sample_rate * max_audio_seconds)
+            )
+        processed_wav = wav_np[:max_samples]
+        processed_duration_s = processed_wav.shape[0] / sample_rate
+        fbank = self.fbank((sample_rate, processed_wav))
+        if fbank.shape[0] < 1:
+            return None
+        if self.cmvn is not None:
+            fbank = self.cmvn(fbank)
+        return FeatureItem(
+            index=index,
+            uttid=uttid,
+            wav_input=wav_input,
+            feature=torch.from_numpy(fbank).float(),
+            duration_s=duration_s,
+            processed_duration_s=processed_duration_s,
+            truncated=processed_wav.shape[0] != wav_np.shape[0],
+        )
+
     def extract_many(
         self, wav_inputs, wav_uttids, max_audio_seconds=None
     ):
@@ -30,31 +62,14 @@ class FeatExtractor:
         for index, (wav_input, uttid) in enumerate(
             zip(wav_inputs, wav_uttids)
         ):
-            sample_rate, wav_np = self._load_waveform(wav_input)
-            duration_s = wav_np.shape[0] / sample_rate
-            max_samples = wav_np.shape[0]
-            if max_audio_seconds is not None:
-                max_samples = min(
-                    max_samples, int(sample_rate * max_audio_seconds)
-                )
-            processed_wav = wav_np[:max_samples]
-            processed_duration_s = processed_wav.shape[0] / sample_rate
-            fbank = self.fbank((sample_rate, processed_wav))
-            if fbank.shape[0] < 1:
-                continue
-            if self.cmvn is not None:
-                fbank = self.cmvn(fbank)
-            items.append(
-                FeatureItem(
-                    index=index,
-                    uttid=uttid,
-                    wav_input=wav_input,
-                    feature=torch.from_numpy(fbank).float(),
-                    duration_s=duration_s,
-                    processed_duration_s=processed_duration_s,
-                    truncated=processed_wav.shape[0] != wav_np.shape[0],
-                )
+            item = self.extract_one(
+                wav_input,
+                uttid,
+                max_audio_seconds,
+                index=index,
             )
+            if item is not None:
+                items.append(item)
         return items
 
     def __call__(self, wav_paths, wav_uttids):
@@ -114,14 +129,20 @@ class KaldifeatFbank:
     def __init__(self, num_mel_bins=80, frame_length=25, frame_shift=10,
                  dither=1.0):
         self.dither = dither
+        self.num_mel_bins = num_mel_bins
+        self.frame_length = frame_length
+        self.frame_shift = frame_shift
+        self.opts = self._make_opts(dither)
+
+    def _make_opts(self, dither):
         opts = knf.FbankOptions()
         opts.frame_opts.dither = dither
-        opts.frame_opts.frame_length_ms = frame_length
-        opts.frame_opts.frame_shift_ms = frame_shift
-        opts.mel_opts.num_bins = num_mel_bins
+        opts.frame_opts.frame_length_ms = self.frame_length
+        opts.frame_opts.frame_shift_ms = self.frame_shift
+        opts.mel_opts.num_bins = self.num_mel_bins
         opts.frame_opts.snip_edges = True
         opts.mel_opts.debug_mel = False
-        self.opts = opts
+        return opts
 
     def __call__(self, wav, is_train=False):
         if type(wav) is str:
@@ -131,8 +152,7 @@ class KaldifeatFbank:
         assert len(wav_np.shape) == 1
 
         dither = self.dither if is_train else 0.0
-        self.opts.frame_opts.dither = dither
-        fbank = knf.OnlineFbank(self.opts)
+        fbank = knf.OnlineFbank(self._make_opts(dither))
 
         fbank.accept_waveform(sample_rate, wav_np.tolist())
         feat = []
@@ -140,6 +160,6 @@ class KaldifeatFbank:
             feat.append(fbank.get_frame(i))
         if len(feat) == 0:
             print("Check data, len(feat) == 0", wav, flush=True)
-            return np.zeros((0, self.opts.mel_opts.num_bins))
+            return np.zeros((0, self.num_mel_bins))
         feat = np.vstack(feat)
         return feat

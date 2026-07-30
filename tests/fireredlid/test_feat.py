@@ -47,6 +47,25 @@ def test_extract_many_truncates_before_fbank_and_keeps_original_duration():
     )
 
 
+def test_extract_one_returns_one_cpu_feature_without_batch_padding():
+    extractor = make_extractor()
+    samples = np.arange(20, dtype=np.int16)
+
+    item = extractor.extract_one(
+        (10, samples),
+        "utt",
+        max_audio_seconds=1.0,
+    )
+
+    assert item.index == 0
+    assert item.uttid == "utt"
+    assert item.feature.device.type == "cpu"
+    assert item.feature.shape == (10, 80)
+    assert item.duration_s == 2.0
+    assert item.processed_duration_s == 1.0
+    assert item.truncated is True
+
+
 def test_legacy_call_applies_cmvn_before_zero_padding():
     extractor = make_extractor()
     first = np.arange(20, dtype=np.int16)
@@ -69,3 +88,11 @@ def test_kaldifeat_fbank_applies_configured_frame_geometry():
 
     assert fbank.opts.frame_opts.frame_length_ms == 30
     assert fbank.opts.frame_opts.frame_shift_ms == 12
+
+
+def test_kaldifeat_fbank_does_not_mutate_shared_options_per_call():
+    fbank = KaldifeatFbank(dither=1.0)
+
+    fbank((16000, np.zeros(400, dtype=np.int16)), is_train=False)
+
+    assert fbank.opts.frame_opts.dither == 1.0

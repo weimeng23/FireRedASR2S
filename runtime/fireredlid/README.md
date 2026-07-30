@@ -299,12 +299,20 @@ single model instance.
 
 ## FastAPI server
 
-The server uses one Uvicorn process, a configurable audio-decode thread pool
-(default 8), one scheduler coroutine, one GPU inference thread, one model
-instance, and one global pending queue with capacity 512 audio items. Decode and
-model work run outside the asyncio event-loop thread. The scheduler combines
-items from concurrent HTTP requests, groups them by duration, and submits one
-physical batch at a time to `FireRedLid.process()`.
+The server uses one Uvicorn process, a configurable CPU preprocessing thread
+pool (default 16), one scheduler coroutine, one GPU inference thread, one model
+instance, and one global pending queue with capacity 512 audio items. Each CPU
+worker performs Base64/WAV decode, FBank, and CMVN before enqueueing a CPU
+feature tensor. The scheduler combines prepared features from concurrent HTTP
+requests, groups them by duration, and submits one physical batch at a time to
+`FireRedLid.process_features()`. Only padding, H2D transfer, Encoder, Decoder,
+and result formatting run on the dedicated model thread. None of this blocking
+work runs on the asyncio event-loop thread.
+
+The existing `decode_workers` setting controls the complete CPU preprocessing
+pool, including FBank. Per-stage synchronized timing remains opt-in in the
+offline benchmark command; the FastAPI request path does not enable it
+continuously.
 
 The defaults are declared once in `configs/fireredlid_server.yaml`:
 

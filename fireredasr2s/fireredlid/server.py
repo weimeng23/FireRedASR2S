@@ -20,8 +20,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from .lid import FireRedLid, FireRedLidConfig
 from .scheduler import (
     BucketPolicy,
-    DecodedLidInput,
     LidBatchScheduler,
+    PreparedLidInput,
     QueueFullError,
     SchedulerClosedError,
 )
@@ -44,7 +44,7 @@ class ServerSettings:
     max_audio_seconds: float = 60.0
     max_request_batch_size: int = 32
     queue_capacity: int = 512
-    decode_workers: int = 8
+    decode_workers: int = 16
     max_batch_delay_ms: float = 5.0
     bucket_policies: tuple[BucketPolicy, ...] = (
         BucketPolicy(5.0, 32),
@@ -286,18 +286,39 @@ def decode_audio(item: LidInput, max_audio_seconds: float):
     return sample_rate, waveform
 
 
+def prepare_audio(item, max_audio_seconds, feature_extractor):
+    wav_input = decode_audio(item, max_audio_seconds)
+    feature_item = feature_extractor.extract_one(
+        wav_input,
+        item.uttid,
+        max_audio_seconds,
+    )
+    if feature_item is None:
+        raise InvalidAudioError(
+            f"audio for uttid '{item.uttid}' produced no feature frames"
+        )
+    return PreparedLidInput(
+        uttid=item.uttid,
+        feature=feature_item.feature,
+        duration_s=feature_item.duration_s,
+        processed_duration_s=feature_item.processed_duration_s,
+        truncated=feature_item.truncated,
+    )
+
+
 class LidService:
     def __init__(
         self,
         model,
         scheduler,
-        decode_executor,
+        preprocess_executor,
         max_request_batch_size: int,
         max_audio_seconds: float = 60.0,
     ):
         self._model = model
         self._scheduler = scheduler
-        self._decode_executor = decode_executor
+        self._preprocess_executor = preprocess_executor
+        self._feature_extractor = model.feat_extractor
         self._max_request_batch_size = max_request_batch_size
         self._max_audio_seconds = max_audio_seconds
 
@@ -323,36 +344,25 @@ class LidService:
         reservation = self._scheduler.reserve(len(inputs))
         loop = asyncio.get_running_loop()
         try:
-            decoded_outputs = await asyncio.gather(
+            prepared_outputs = await asyncio.gather(
                 *[
                     loop.run_in_executor(
-                        self._decode_executor,
-                        decode_audio,
+                        self._preprocess_executor,
+                        prepare_audio,
                         item,
                         self._max_audio_seconds,
+                        self._feature_extractor,
                     )
                     for item in inputs
                 ],
                 return_exceptions=True,
             )
-            for output in decoded_outputs:
+            for output in prepared_outputs:
                 if isinstance(output, BaseException):
                     raise output
-            decoded = [
-                DecodedLidInput(
-                    uttid=item.uttid,
-                    wav_input=wav_input,
-                    duration_s=wav_input[1].size / wav_input[0],
-                )
-                for item, wav_input in zip(
-                    inputs,
-                    decoded_outputs,
-                    strict=True,
-                )
-            ]
             futures = self._scheduler.submit_reserved(
                 reservation,
-                decoded,
+                prepared_outputs,
             )
         except BaseException:
             self._scheduler.release(reservation)
@@ -407,9 +417,9 @@ def create_app(
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        decode_executor = ThreadPoolExecutor(
+        preprocess_executor = ThreadPoolExecutor(
             max_workers=settings.decode_workers,
-            thread_name_prefix="lid-decode",
+            thread_name_prefix="lid-preprocess",
         )
         gpu_executor = ThreadPoolExecutor(
             max_workers=1,
@@ -455,7 +465,7 @@ def create_app(
             app.state.lid_service = LidService(
                 model,
                 scheduler,
-                decode_executor,
+                preprocess_executor,
                 max_request_batch_size=settings.max_request_batch_size,
                 max_audio_seconds=settings.max_audio_seconds,
             )
@@ -468,7 +478,7 @@ def create_app(
                 if hasattr(app.state, "lid_service"):
                     del app.state.lid_service
                 try:
-                    decode_executor.shutdown(wait=True)
+                    preprocess_executor.shutdown(wait=True)
                 finally:
                     gpu_executor.shutdown(wait=True)
 

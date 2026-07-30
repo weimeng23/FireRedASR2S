@@ -4,11 +4,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
+import torch
 
 from fireredasr2s.fireredlid.scheduler import (
     BucketPolicy,
-    DecodedLidInput,
     LidBatchScheduler,
+    PreparedLidInput,
     QueueFullError,
     SchedulerClosedError,
 )
@@ -29,13 +30,84 @@ class RecordingEngine:
             for uttid in uttids
         ]
 
+    def process_features(self, items):
+        return self.process(
+            [item.uttid for item in items],
+            [item.feature for item in items],
+        )
+
 
 def decoded(uttid, duration_s):
-    return DecodedLidInput(
+    return PreparedLidInput(
         uttid=uttid,
-        wav_input=(16000, np.zeros(int(duration_s * 16000), dtype=np.int16)),
+        feature=np.zeros((int(duration_s * 100), 80), dtype=np.float32),
         duration_s=duration_s,
+        processed_duration_s=duration_s,
+        truncated=False,
     )
+
+
+def poisoned(uttid, duration_s=1):
+    return PreparedLidInput(
+        uttid=uttid,
+        feature="poison",
+        duration_s=duration_s,
+        processed_duration_s=duration_s,
+        truncated=False,
+    )
+
+
+def test_scheduler_passes_prepared_feature_batch_to_gpu_executor():
+    class FeatureOnlyEngine:
+        def __init__(self):
+            self.items = None
+
+        def process(self, *args):
+            raise AssertionError("GPU executor must not receive waveforms")
+
+        def process_features(self, items):
+            self.items = items
+            return [
+                {
+                    "uttid": item.uttid,
+                    "lang": "en",
+                    "confidence": 0.9,
+                }
+                for item in items
+            ]
+
+    async def scenario():
+        engine = FeatureOnlyEngine()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            scheduler = LidBatchScheduler(
+                engine=engine,
+                executor=executor,
+                queue_capacity=512,
+                max_batch_delay_ms=0,
+                bucket_policies=(BucketPolicy(60, 2),),
+            )
+            await scheduler.start()
+            future = scheduler.submit_many(
+                [
+                    PreparedLidInput(
+                        uttid="one",
+                        feature=torch.ones(100, 80),
+                        duration_s=1.0,
+                        processed_duration_s=1.0,
+                        truncated=False,
+                    )
+                ]
+            )[0]
+            result = await future
+            await scheduler.stop()
+        return engine.items, result
+
+    items, result = asyncio.run(scenario())
+
+    assert len(items) == 1
+    assert items[0].feature.shape == (100, 80)
+    assert items[0].wav_input is None
+    assert result["uttid"] == "one"
 
 
 def test_scheduler_combines_independent_submissions_on_gpu_thread():
@@ -101,12 +173,9 @@ def test_scheduler_does_not_mix_duration_buckets():
 
     batches = asyncio.run(scenario())
 
-    assert [
-        [waveform.size for _, waveform in batch]
-        for batch in batches
-    ] == [
-        [16000, 32000],
-        [320000],
+    assert [[feature.shape[0] for feature in batch] for batch in batches] == [
+        [100, 200],
+        [2000],
     ]
 
 
@@ -213,12 +282,16 @@ def test_scheduler_retries_good_items_once_using_reported_bad_indices():
     class PoisonEngine(RecordingEngine):
         def process(self, uttids, wav_inputs):
             self.calls.append(list(uttids))
-            if any(wav_input == "poison" for wav_input in wav_inputs):
+            if any(
+                isinstance(wav_input, str) and wav_input == "poison"
+                for wav_input in wav_inputs
+            ):
                 error = FloatingPointError("non-finite confidence")
                 error.sample_indices = tuple(
                     index
                     for index, wav_input in enumerate(wav_inputs)
-                    if wav_input == "poison"
+                    if isinstance(wav_input, str)
+                    and wav_input == "poison"
                 )
                 raise error
             return [
@@ -246,11 +319,7 @@ def test_scheduler_retries_good_items_once_using_reported_bad_indices():
                 decoded("bad", 1),
                 decoded("good-2", 1),
             ]
-            items[1] = DecodedLidInput(
-                uttid="bad",
-                wav_input="poison",
-                duration_s=1,
-            )
+            items[1] = poisoned("bad")
             first, bad, second = scheduler.submit_many(items)
             first_result = await first
             with pytest.raises(FloatingPointError, match="non-finite"):
@@ -304,7 +373,7 @@ def test_scheduler_keeps_shrinking_when_bad_indices_arrive_in_stages():
         def process(self, uttids, wav_inputs):
             self.calls.append(list(uttids))
             for index, wav_input in enumerate(wav_inputs):
-                if wav_input == "poison":
+                if isinstance(wav_input, str) and wav_input == "poison":
                     error = FloatingPointError("non-finite confidence")
                     error.sample_indices = (index,)
                     raise error
@@ -330,9 +399,9 @@ def test_scheduler_keeps_shrinking_when_bad_indices_arrive_in_stages():
             await scheduler.start()
             items = [
                 decoded("good-1", 1),
-                DecodedLidInput("bad-1", "poison", 1),
+                poisoned("bad-1"),
                 decoded("good-2", 1),
-                DecodedLidInput("bad-2", "poison", 1),
+                poisoned("bad-2"),
                 decoded("good-3", 1),
             ]
             outcomes = await asyncio.gather(

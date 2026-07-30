@@ -214,6 +214,25 @@ def test_infer_items_executes_one_physical_batch_in_input_order():
     assert lid.model.batch_sizes == [3]
 
 
+def test_process_features_skips_feature_extraction_and_runs_one_batch():
+    class UnexpectedFeatureExtractor:
+        def extract_many(self, *args, **kwargs):
+            raise AssertionError("feature extraction must stay outside GPU work")
+
+    lid = make_lid(FireRedLidConfig(use_gpu=False))
+    lid.feat_extractor = UnexpectedFeatureExtractor()
+
+    results = lid.process_features(
+        [
+            item(0, 3, 1),
+            item(1, 7, 2),
+        ]
+    )
+
+    assert [result["lang"] for result in results] == ["3", "7"]
+    assert lid.model.batch_sizes == [2]
+
+
 def test_engine_rejects_batch_over_backend_limit_without_splitting():
     lid = make_lid(
         FireRedLidConfig(

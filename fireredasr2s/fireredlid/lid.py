@@ -275,6 +275,12 @@ class FireRedLid:
         return ordered
 
     @torch.no_grad()
+    def process_features(self, items):
+        if not items:
+            return []
+        return self._infer_items(items)
+
+    @torch.no_grad()
     def process(self, batch_uttid, batch_wav_path):
         with self._measure_stage("fbank"):
             items = self.feat_extractor.extract_many(
@@ -282,9 +288,7 @@ class FireRedLid:
                 batch_uttid,
                 max_audio_seconds=self.config.max_audio_seconds,
             )
-        if not items:
-            return []
-        return self._infer_items(items)
+        return self.process_features(items)
 
 
 def load_fireredlid_model(model_path):

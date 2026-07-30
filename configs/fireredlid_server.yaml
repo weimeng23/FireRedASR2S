@@ -4,7 +4,8 @@ server:
   log_level: info
   max_request_batch_size: 32
   queue_capacity: 512
-  decode_workers: 8
+  # CPU workers for Base64/WAV decode, FBank, and CMVN.
+  decode_workers: 16
 
 scheduler:
   max_batch_delay_ms: 5

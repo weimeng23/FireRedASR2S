@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from itertools import count
 from time import monotonic
 
+from torch import Tensor
+
+from .runtime.batch_planner import FeatureItem
+
 
 logger = logging.getLogger(__name__)
 
@@ -15,10 +19,12 @@ class BucketPolicy:
 
 
 @dataclass(frozen=True)
-class DecodedLidInput:
+class PreparedLidInput:
     uttid: str
-    wav_input: object
+    feature: Tensor
     duration_s: float
+    processed_duration_s: float
+    truncated: bool
 
 
 class QueueFullError(RuntimeError):
@@ -31,7 +37,7 @@ class SchedulerClosedError(RuntimeError):
 
 @dataclass
 class _PendingTask:
-    item: DecodedLidInput
+    item: PreparedLidInput
     future: asyncio.Future
     enqueued_at: float
 
@@ -270,15 +276,25 @@ class LidBatchScheduler:
                 f"lid-inference-{next(self._inference_ids)}"
                 for _ in remaining_tasks
             ]
-            wav_inputs = [
-                task.item.wav_input for task in remaining_tasks
+            feature_items = [
+                FeatureItem(
+                    index=index,
+                    uttid=inference_id,
+                    wav_input=None,
+                    feature=task.item.feature,
+                    duration_s=task.item.duration_s,
+                    processed_duration_s=task.item.processed_duration_s,
+                    truncated=task.item.truncated,
+                )
+                for index, (inference_id, task) in enumerate(
+                    zip(inference_ids, remaining_tasks, strict=True)
+                )
             ]
             try:
                 results = await loop.run_in_executor(
                     self._executor,
-                    self._engine.process,
-                    inference_ids,
-                    wav_inputs,
+                    self._engine.process_features,
+                    feature_items,
                 )
             except FloatingPointError as error:
                 bad_indices = tuple(

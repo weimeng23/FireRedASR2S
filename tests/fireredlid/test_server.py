@@ -9,10 +9,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 import soundfile as sf
+import torch
 import yaml
 from fastapi.testclient import TestClient
 
 import fireredasr2s.fireredlid.server as server_module
+from fireredasr2s.fireredlid.runtime.batch_planner import FeatureItem
 from fireredasr2s.fireredlid.server import (
     BucketPolicy,
     ServerSettings,
@@ -23,14 +25,36 @@ from fireredasr2s.fireredlid.server import (
 )
 
 
+class FakeFeatureExtractor:
+    def extract_one(self, wav_input, uttid, max_audio_seconds):
+        sample_rate, waveform = wav_input
+        duration_s = waveform.size / sample_rate
+        return FeatureItem(
+            index=0,
+            uttid=uttid,
+            wav_input=wav_input,
+            feature=torch.ones(max(1, waveform.size // 160), 80),
+            duration_s=duration_s,
+            processed_duration_s=duration_s,
+            truncated=False,
+        )
+
+
 class FakeLid:
     active_backend = "compile"
+    feat_extractor = FakeFeatureExtractor()
 
     def process(self, uttids, wav_inputs):
         return [
             {"uttid": uttid, "lang": "en", "confidence": 0.99}
             for uttid in uttids
         ]
+
+    def process_features(self, items):
+        return self.process(
+            [item.uttid for item in items],
+            [item.feature for item in items],
+        )
 
 
 def encode_wav(*, channels=1, sample_rate=16000, sample_count=1600):
@@ -48,12 +72,50 @@ def encode_wav(*, channels=1, sample_rate=16000, sample_count=1600):
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+def test_prepare_audio_extracts_cpu_feature_before_scheduling():
+    class RecordingExtractor:
+        def __init__(self):
+            self.wav_input = None
+
+        def extract_one(self, wav_input, uttid, max_audio_seconds):
+            self.wav_input = wav_input
+            return FeatureItem(
+                index=0,
+                uttid=uttid,
+                wav_input=wav_input,
+                feature=torch.ones(8, 80),
+                duration_s=0.1,
+                processed_duration_s=0.1,
+                truncated=False,
+            )
+
+    extractor = RecordingExtractor()
+    prepared = server_module.prepare_audio(
+        server_module.LidInput(
+            uttid="one",
+            audio_base64=encode_wav(),
+        ),
+        60.0,
+        extractor,
+    )
+
+    assert prepared.uttid == "one"
+    assert prepared.feature.device.type == "cpu"
+    assert prepared.feature.shape == (8, 80)
+    assert prepared.duration_s == 0.1
+    assert prepared.processed_duration_s == 0.1
+    assert prepared.truncated is False
+    sample_rate, waveform = extractor.wav_input
+    assert sample_rate == 16000
+    assert waveform.dtype == np.int16
+
+
 def test_server_settings_use_dynamic_batching_and_mixed_precision_defaults():
     settings = ServerSettings(model_dir="/models/FireRedLID")
 
     assert settings.port == 12345
     assert settings.queue_capacity == 512
-    assert settings.decode_workers == 8
+    assert settings.decode_workers == 16
     assert settings.max_batch_delay_ms == 5.0
     assert settings.encoder_precision == "fp16"
     assert settings.decoder_precision == "fp32"
@@ -123,7 +185,7 @@ def test_app_loads_model_once_and_reports_active_backend():
 
 
 def test_infer_decodes_ordered_logical_batch_and_returns_results():
-    class RecordingLid:
+    class RecordingLid(FakeLid):
         active_backend = "eager"
 
         def __init__(self):
@@ -168,12 +230,14 @@ def test_infer_decodes_ordered_logical_batch_and_returns_results():
             {"uttid": "second", "lang": "lang-1", "confidence": 0.9},
         ],
     }
-    uttids, wav_inputs = model.calls[0]
+    uttids, features = model.calls[0]
     assert len(uttids) == 2
     assert len(set(uttids)) == 2
-    assert [sample_rate for sample_rate, _ in wav_inputs] == [16000, 16000]
-    assert all(waveform.dtype == np.int16 for _, waveform in wav_inputs)
-    assert all(waveform.ndim == 1 for _, waveform in wav_inputs)
+    assert [feature.shape for feature in features] == [
+        (10, 80),
+        (10, 80),
+    ]
+    assert all(feature.device.type == "cpu" for feature in features)
 
 
 def test_infer_rejects_invalid_base64_audio():
@@ -499,11 +563,17 @@ def test_scheduler_worker_fatal_maps_current_request_to_http_503(
     assert "secret scheduler failure" not in response.text
 
 
-def test_model_load_and_inference_use_the_same_dedicated_thread():
+def test_preprocessing_is_separate_from_dedicated_model_thread():
     thread_ids = {}
+
+    class ThreadRecordingExtractor(FakeFeatureExtractor):
+        def extract_one(self, *args, **kwargs):
+            thread_ids["preprocess"] = threading.get_ident()
+            return super().extract_one(*args, **kwargs)
 
     class ThreadRecordingLid(FakeLid):
         active_backend = "eager"
+        feat_extractor = ThreadRecordingExtractor()
 
         def process(self, uttids, wav_inputs):
             thread_ids["infer"] = threading.get_ident()
@@ -538,6 +608,8 @@ def test_model_load_and_inference_use_the_same_dedicated_thread():
     assert response.status_code == 200
     assert thread_ids["load"] == thread_ids["infer"]
     assert thread_ids["load"] != main_thread
+    assert thread_ids["preprocess"] != main_thread
+    assert thread_ids["preprocess"] != thread_ids["infer"]
 
 
 def test_health_remains_responsive_while_inference_thread_is_busy():
@@ -648,7 +720,7 @@ def test_lifespan_releases_executors_when_scheduler_stop_raises(monkeypatch):
         with TestClient(app):
             pass
 
-    assert shutdown_threads == ["lid-decode", "lid-gpu"]
+    assert shutdown_threads == ["lid-preprocess", "lid-gpu"]
 
 
 def test_server_settings_reject_non_positive_request_batch_limit():
@@ -873,7 +945,7 @@ def test_checked_in_server_yaml_uses_production_defaults():
     assert settings.model_dir == "/models/FireRedLID"
     assert settings.port == 12345
     assert settings.queue_capacity == 512
-    assert settings.decode_workers == 8
+    assert settings.decode_workers == 16
     assert settings.encoder_precision == "fp16"
     assert settings.decoder_precision == "fp32"
     assert [
