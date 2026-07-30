@@ -372,6 +372,28 @@ uv run python runtime/fireredlid/client.py /path/to/test.wav \
   --repeat 3
 ```
 
+Benchmark concurrent HTTP requests from the host. Use
+`--request-batch-size 1` to measure cross-request dynamic batching:
+
+```bash
+python3 runtime/fireredlid/server_benchmark.py \
+  --manifest runtime/fireredlid/example_manifest.jsonl \
+  --url http://127.0.0.1:12345/v1/lid \
+  --concurrency 8 \
+  --requests 100 \
+  --request-batch-size 1 \
+  --warmup-requests 8 \
+  --output runtime/fireredlid/artifacts/server.eager.c8.json
+```
+
+The report contains successful and failed request/item counts, error rate,
+request P50/P95/P99 latency, requests/s, items/s, successful audio-seconds/s,
+and the backend/precision metadata returned by the server. The process exits
+non-zero if any measured request fails. Increase `--concurrency` through 8, 16,
+and 32 while keeping the manifest and request count fixed. Increasing
+`--request-batch-size` instead measures multi-item HTTP requests rather than
+cross-request batching.
+
 Create a JSON request and run inference:
 
 ```bash
