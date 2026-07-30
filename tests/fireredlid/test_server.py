@@ -1,6 +1,8 @@
 import base64
 import io
 import inspect
+import json
+import logging
 import threading
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
@@ -151,6 +153,63 @@ def test_server_settings_preserve_runtime_backend_configuration():
     assert config.fallback_backend == "eager"
     assert config.max_audio_seconds == 30.0
     assert config.return_diagnostics is True
+
+
+def test_app_logs_all_effective_server_settings_at_startup(caplog):
+    settings = ServerSettings(
+        model_dir="/models/FireRedLID",
+        backend="compile",
+        profile="throughput",
+        use_gpu=False,
+        engine_dir="/engines/l20",
+        fallback_backend="eager",
+        max_audio_seconds=30.0,
+        max_request_batch_size=4,
+        queue_capacity=64,
+        decode_workers=3,
+        max_batch_delay_ms=7.5,
+        bucket_policies=(BucketPolicy(30.0, 4),),
+        encoder_precision="fp32",
+        decoder_precision="bf16",
+        host="127.0.0.1",
+        port=9000,
+        log_level="debug",
+    )
+    app = create_app(settings, model_loader=lambda *_: FakeLid())
+    prefix = "FireRedLID server settings: "
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        with TestClient(app):
+            pass
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith(prefix)
+    ]
+    assert len(messages) == 1
+    assert json.loads(messages[0][len(prefix) :]) == {
+        "backend": "compile",
+        "bucket_policies": [
+            {"max_batch_size": 4, "max_seconds": 30.0}
+        ],
+        "decode_workers": 3,
+        "decoder_precision": "bf16",
+        "encoder_precision": "fp32",
+        "engine_dir": "/engines/l20",
+        "fallback_backend": "eager",
+        "host": "127.0.0.1",
+        "log_level": "debug",
+        "max_audio_seconds": 30.0,
+        "max_batch_delay_ms": 7.5,
+        "max_request_batch_size": 4,
+        "model_dir": "/models/FireRedLID",
+        "port": 9000,
+        "profile": "throughput",
+        "queue_capacity": 64,
+        "use_gpu": False,
+        "use_half": None,
+    }
 
 
 def test_app_loads_model_once_and_reports_active_backend():

@@ -3,12 +3,13 @@ import asyncio
 import base64
 import binascii
 import io
+import json
 import logging
 import math
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import soundfile as sf
@@ -28,6 +29,7 @@ from .scheduler import (
 
 
 logger = logging.getLogger(__name__)
+startup_logger = logging.getLogger("uvicorn.error")
 
 MIN_AUDIO_DURATION_S = 0.025
 
@@ -417,6 +419,10 @@ def create_app(
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        startup_logger.info(
+            "FireRedLID server settings: %s",
+            json.dumps(asdict(settings), sort_keys=True),
+        )
         preprocess_executor = ThreadPoolExecutor(
             max_workers=settings.decode_workers,
             thread_name_prefix="lid-preprocess",

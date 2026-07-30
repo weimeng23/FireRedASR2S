@@ -323,6 +323,11 @@ The defaults are declared once in `configs/fireredlid_server.yaml`:
 - The encoder uses FP16 and the PyTorch decoder uses FP32.
 - The server listens on `0.0.0.0:12345`.
 
+At application startup, the server writes the complete effective
+`ServerSettings` as one JSON log line before loading the model. This includes
+defaults, YAML values, and CLI overrides, so the same record is available
+through `docker logs`.
+
 Start with the checked-in configuration:
 
 ```bash
