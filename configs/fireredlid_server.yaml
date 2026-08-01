@@ -2,22 +2,22 @@ server:
   host: 0.0.0.0
   port: 12345
   log_level: info
-  max_request_batch_size: 32
-  queue_capacity: 512
+  max_request_batch_size: 64
+  queue_capacity: 1024
   # CPU workers for Base64/WAV decode, FBank, and CMVN.
-  decode_workers: 16
+  decode_workers: 20
 
 scheduler:
-  max_batch_delay_ms: 5
+  max_batch_delay_ms: 10
   buckets:
     - max_seconds: 5
-      max_batch_size: 32
+      max_batch_size: 64
     - max_seconds: 15
-      max_batch_size: 16
+      max_batch_size: 32
     - max_seconds: 30
-      max_batch_size: 8
+      max_batch_size: 16
     - max_seconds: 60
-      max_batch_size: 4
+      max_batch_size: 8
 
 runtime:
   backend: eager
