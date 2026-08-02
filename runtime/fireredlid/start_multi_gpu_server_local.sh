@@ -11,7 +11,7 @@ Usage:
     [--base-port 12400]
 
 Starts one FireRedLID server process per selected GPU using this repository's
-.venv and entrypoint.sh. Run `uv sync --python 3.12` before using it.
+.venv. Run `uv sync --python 3.12` before using it.
 EOF
 }
 
@@ -67,16 +67,11 @@ esac
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
-entrypoint="${repo_root}/entrypoint.sh"
-venv_path="${repo_root}/.venv"
+server_bin="${repo_root}/.venv/bin/fireredlid-server"
 run_dir="${FIREREDLID_RUN_DIR:-/tmp/fireredlid-server-local}"
 
-if [[ ! -x "${entrypoint}" ]]; then
-    echo "entrypoint is not executable: ${entrypoint}" >&2
-    exit 2
-fi
-if [[ ! -f "${venv_path}/bin/activate" ]]; then
-    echo "missing project environment: ${venv_path}; run uv sync first" >&2
+if [[ ! -x "${server_bin}" ]]; then
+    echo "missing server executable: ${server_bin}; run uv sync first" >&2
     exit 2
 fi
 
@@ -128,8 +123,7 @@ for index in "${!selected_gpus[@]}"; do
 
     nohup env \
         CUDA_VISIBLE_DEVICES="${gpu}" \
-        FIREREDLID_VENV_PATH="${venv_path}" \
-        "${entrypoint}" \
+        "${server_bin}" \
         --config "${config_path}" \
         --model-dir "${model_dir}" \
         --port "${port}" \
