@@ -8,9 +8,10 @@ Usage:
     --config PATH \
     --model-dir PATH \
     [--gpu-ids 0,1,2,3,4,5,6,7] \
+    [--instances-per-gpu 1] \
     [--base-port 12400]
 
-Starts one FireRedLID server process per selected GPU. Server settings come
+Starts one or more FireRedLID server processes per selected GPU. Settings come
 from the YAML config; only model_dir and the per-process port are overridden.
 EOF
 }
@@ -18,6 +19,7 @@ EOF
 config_path=""
 model_dir=""
 gpu_ids=""
+instances_per_gpu=1
 base_port=12400
 
 while [[ $# -gt 0 ]]; do
@@ -32,6 +34,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --gpu-ids)
             gpu_ids="${2:-}"
+            shift 2
+            ;;
+        --instances-per-gpu)
+            instances_per_gpu="${2:-}"
             shift 2
             ;;
         --base-port)
@@ -61,6 +67,12 @@ fi
 case "${base_port}" in
     "" | *[!0-9]*)
         echo "--base-port must be an integer" >&2
+        exit 2
+        ;;
+esac
+case "${instances_per_gpu}" in
+    "" | 0* | *[!0-9]*)
+        echo "--instances-per-gpu must be a positive integer" >&2
         exit 2
         ;;
 esac
@@ -96,7 +108,9 @@ if [[ ${#selected_gpus[@]} -eq 0 || -z "${selected_gpus[0]}" ]]; then
     echo "no GPUs selected" >&2
     exit 2
 fi
-if ((base_port + ${#selected_gpus[@]} - 1 > 65535)); then
+gpu_count=${#selected_gpus[@]}
+process_count=$((gpu_count * instances_per_gpu))
+if ((base_port + process_count - 1 > 65535)); then
     echo "selected ports exceed 65535" >&2
     exit 2
 fi
@@ -105,27 +119,37 @@ log_dir="${run_dir}/logs"
 pid_dir="${run_dir}/pids"
 mkdir -p "${log_dir}" "${pid_dir}"
 
-for index in "${!selected_gpus[@]}"; do
-    gpu="${selected_gpus[$index]}"
-    port=$((base_port + index))
-    log_path="${log_dir}/gpu-${gpu}.log"
-    pid_path="${pid_dir}/gpu-${gpu}.pid"
-
-    if [[ -f "${pid_path}" ]]; then
-        existing_pid="$(cat "${pid_path}")"
-        if kill -0 "${existing_pid}" 2>/dev/null; then
-            echo "GPU ${gpu} server is already running as PID ${existing_pid}" >&2
-            exit 1
+for ((instance = 0; instance < instances_per_gpu; instance++)); do
+    for index in "${!selected_gpus[@]}"; do
+        gpu="${selected_gpus[$index]}"
+        port=$((base_port + instance * gpu_count + index))
+        file_stem="gpu-${gpu}"
+        if ((instance > 0)); then
+            file_stem+="-instance-${instance}"
         fi
-    fi
+        log_path="${log_dir}/${file_stem}.log"
+        pid_path="${pid_dir}/${file_stem}.pid"
 
-    nohup env CUDA_VISIBLE_DEVICES="${gpu}" \
-        "${entrypoint}" \
-        --config "${config_path}" \
-        --model-dir "${model_dir}" \
-        --port "${port}" \
-        >"${log_path}" 2>&1 &
-    pid=$!
-    echo "${pid}" >"${pid_path}"
-    echo "GPU ${gpu}: PID ${pid}, http://127.0.0.1:${port}, log=${log_path}"
+        if [[ -f "${pid_path}" ]]; then
+            existing_pid="$(cat "${pid_path}")"
+            if kill -0 "${existing_pid}" 2>/dev/null; then
+                echo "GPU ${gpu} instance ${instance} is already running as PID ${existing_pid}" >&2
+                exit 1
+            fi
+        fi
+
+        nohup env CUDA_VISIBLE_DEVICES="${gpu}" \
+            "${entrypoint}" \
+            --config "${config_path}" \
+            --model-dir "${model_dir}" \
+            --port "${port}" \
+            >"${log_path}" 2>&1 &
+        pid=$!
+        echo "${pid}" >"${pid_path}"
+        if ((instances_per_gpu == 1)); then
+            echo "GPU ${gpu}: PID ${pid}, http://127.0.0.1:${port}, log=${log_path}"
+        else
+            echo "GPU ${gpu} instance ${instance}: PID ${pid}, http://127.0.0.1:${port}, log=${log_path}"
+        fi
+    done
 done
