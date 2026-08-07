@@ -5,19 +5,19 @@ server:
   max_request_batch_size: 64
   queue_capacity: 1024
   # CPU workers for Base64/WAV decode, FBank, and CMVN.
-  decode_workers: 20
+  decode_workers: 25
 
 scheduler:
   max_batch_delay_ms: 10
   buckets:
     - max_seconds: 5
-      max_batch_size: 64
+      max_batch_size: 96
     - max_seconds: 15
-      max_batch_size: 32
+      max_batch_size: 40
     - max_seconds: 30
-      max_batch_size: 16
+      max_batch_size: 20
     - max_seconds: 60
-      max_batch_size: 8
+      max_batch_size: 10
 
 runtime:
   backend: eager
