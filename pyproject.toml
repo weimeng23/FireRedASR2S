@@ -15,6 +15,7 @@ dependencies = [
     "transformers==5.1.0",
     "fastapi==0.139.0",
     "uvicorn[standard]==0.51.0",
+    "python-multipart>=0.0.22,<0.1",
     "numpy>=2.4.2,<3.0.0",
     "cn2an>=0.5.23",
     "kaldiio>=2.18.1",
@@ -37,6 +38,7 @@ dev = [
 [project.scripts]
 fireredasr2s-cli = "fireredasr2s.fireredasr2s_cli:cli_main"
 fireredlid-server = "fireredasr2s.fireredlid.server:main"
+fireredppl-server = "fireredasr2s.fireredppl.server:main"
 
 [tool.setuptools.packages.find]
 include = ["fireredasr2s*"]

@@ -1,0 +1,39 @@
+model:
+  # Supply --model-dir /path/to/FireRedASR2-AED at startup.
+  scorer_type: aed
+  max_audio_seconds: 60.0
+  max_candidates: 64
+  max_text_tokens: 512
+  include_eos: true
+  softmax_smoothing: 1.0
+
+runtime:
+  use_gpu: true
+  # Establish the FP32 baseline first. Validate ranking before changing precision.
+  encoder_precision: fp16
+  decoder_precision: fp16
+
+server:
+  host: 0.0.0.0
+  port: 12345
+  decode_workers: 16  # CPU PCM validation, FBank/CMVN and tokenization; no WAV decoding.
+  queue_capacity: 512
+  queue_max_candidates: 2048
+  queue_max_tokens: 131072
+  max_request_bytes: 16777216  # 16 MiB, including PCM and multipart metadata
+  request_timeout_s: 30.0
+
+scheduler:
+  max_batch_delay_ms: 10.0
+  buckets:
+    - {max_seconds: 5.0, max_batch_size: 32}
+    - {max_seconds: 15.0, max_batch_size: 16}
+    - {max_seconds: 30.0, max_batch_size: 8}
+    - {max_seconds: 60.0, max_batch_size: 2}
+  # Budgets cover the full audio buckets; decoder allows 32 x 128-token candidates.
+  # These are work limits, not measured GPU memory guarantees.
+  encoder_max_padded_frames: 24000
+  encoder_max_attention_elements: 8000000
+  decoder_max_batch_size: 32
+  decoder_max_padded_tokens: 4096
+  decoder_max_attention_elements: 8000000
