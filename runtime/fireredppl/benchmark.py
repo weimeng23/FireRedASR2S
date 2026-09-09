@@ -103,7 +103,7 @@ def benchmark(url, rows, concurrency, repeats, timeout):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", required=True, help="service base URL, e.g. http://127.0.0.1:12345")
+    parser.add_argument("--url", required=True, help="full scoring endpoint URL, e.g. http://127.0.0.1:12345/score")
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 16, 32])
     parser.add_argument("--repeats", type=int, default=3)
@@ -114,7 +114,7 @@ def main():
     if min(args.concurrency) < 1 or args.repeats < 1 or args.warmup < 0 or args.timeout <= 0:
         parser.error("concurrency/repeats/timeout must be positive; warmup must be nonnegative")
     rows = load_manifest(args.manifest)
-    url = args.url.rstrip("/") + "/score"
+    url = args.url
     for index in range(args.warmup):
         call_score(url, rows[index % len(rows)], args.timeout)
     reports = []

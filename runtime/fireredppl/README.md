@@ -164,7 +164,7 @@ Paths are resolved relative to the manifest. The benchmark reads mono 16 kHz
 PCM16 WAV sources locally before timing, and transmits only raw int16 PCM. Run:
 
 ```bash
-python runtime/fireredppl/benchmark.py --url http://127.0.0.1:12345 \
+python runtime/fireredppl/benchmark.py --url http://127.0.0.1:12345/score \
   --manifest /data/ppl_samples.jsonl --concurrency 1 8 16 32 \
   --repeats 5 --output /tmp/ppl_benchmark.json
 ```
