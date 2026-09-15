@@ -143,7 +143,7 @@ for ((instance = 0; instance < instances_per_gpu; instance++)); do
             --config "${config_path}" \
             --model-dir "${model_dir}" \
             --port "${port}" \
-            >"${log_path}" 2>&1 &
+            >> "${log_path}" 2>&1 &
         pid=$!
         echo "${pid}" >"${pid_path}"
         if ((instances_per_gpu == 1)); then

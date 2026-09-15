@@ -2,6 +2,7 @@ __pycache__
 out
 *.tar.gz
 *.wav
+*.pcm
 *.TextGrid
 *.srt
 text
@@ -18,3 +19,4 @@ uv.lock
 Dockerfile.*
 start_docker.sh
 polaris_client.py
+outputs/

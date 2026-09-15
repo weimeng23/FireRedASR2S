@@ -127,7 +127,7 @@ for index in "${!selected_gpus[@]}"; do
         --config "${config_path}" \
         --model-dir "${model_dir}" \
         --port "${port}" \
-        >"${log_path}" 2>&1 &
+        >> "${log_path}" 2>&1 &
     pid=$!
     echo "${pid}" >"${pid_path}"
     echo "GPU ${gpu}: PID ${pid}, http://127.0.0.1:${port}, log=${log_path}"
