@@ -93,13 +93,17 @@ trap cleanup EXIT
 upstream fireredlid_servers {
     zone fireredlid_servers 256k;
     least_conn;
-    keepalive 64;
 EOF
     for ((index = 0; index < instances; index++)); do
         port=$((base_port + index))
-        echo "    server 127.0.0.1:${port} max_fails=2 fail_timeout=10s;"
+        echo "    server 127.0.0.1:${port} max_fails=5 fail_timeout=2s;"
     done
     cat <<EOF
+
+    keepalive 64;
+    keepalive_requests 1000;
+    # Close idle upstream connections before Uvicorn's default 5s timeout.
+    keepalive_timeout 4s;
 }
 
 server {
@@ -107,7 +111,9 @@ server {
     server_name _;
 
     client_max_body_size 192m;
-    client_body_timeout 300s;
+    client_body_timeout 60s;
+    # Limit per-request memory buffering; larger bodies may use temporary files.
+    client_body_buffer_size 64m;
 
     location / {
         proxy_pass http://fireredlid_servers;
@@ -117,10 +123,17 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_connect_timeout 5s;
-        proxy_send_timeout 300s;
-        proxy_read_timeout 300s;
-        proxy_request_buffering off;
+        proxy_connect_timeout 1s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+        # Retain the request body so retries can replay it upstream.
+        proxy_request_buffering on;
+        # Queue-full 429 responses occur before inference, so replay is safe.
+        # Retry connection errors for availability; errors after sending a POST
+        # may duplicate inference. non_idempotent also permits those retries.
+        # Do not retry timeouts, which may leave inference running upstream.
+        proxy_next_upstream error http_429 non_idempotent;
+        proxy_next_upstream_tries 2;
     }
 }
 EOF
