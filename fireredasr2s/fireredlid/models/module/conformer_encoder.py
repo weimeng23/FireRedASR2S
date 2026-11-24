@@ -38,13 +38,17 @@ class ConformerEncoder(nn.Module):
             enc_output = enc_layer(enc_output, pos_emb, slf_attn_mask=src_mask,
                                    pad_mask=src_mask)
 
+        if torch.onnx.is_in_onnx_export():
+            # TensorRT 10.3 accepts UINT8 at I/O and converts to it from floating point.
+            src_mask = src_mask.float().to(torch.uint8)
         return enc_output, input_lengths, src_mask
 
     def padding_position_is_0(self, padded_input, input_lengths):
         time_index = torch.arange(
             padded_input.size(1), device=padded_input.device)
         mask = time_index.unsqueeze(0) < input_lengths.unsqueeze(1)
-        return mask.unsqueeze(dim=1).to(torch.uint8)
+        dtype = torch.int32 if torch.onnx.is_in_onnx_export() else torch.uint8
+        return mask.unsqueeze(dim=1).to(dtype)
 
 
 class RelPosEmbConformerBlock(nn.Module):

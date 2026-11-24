@@ -271,6 +271,26 @@ def test_export_supports_dynamic_batch_and_time(tmp_path):
     )
 
 
+def test_conformer_export_keeps_uint8_at_mask_output_only(tmp_path):
+    from fireredasr2s.fireredlid.models.module.conformer_encoder import ConformerEncoder
+
+    encoder = ConformerEncoder(idim=80, n_layers=1, n_head=2, d_model=8, kernel_size=3).eval()
+    path = tmp_path / "encoder.onnx"
+    load_export_module().export_encoder(
+        encoder, path, torch.zeros(1, 16, 80), torch.tensor([16]),
+    )
+    graph = onnx.shape_inference.infer_shapes(onnx.load(path)).graph
+    assert graph.output[2].name == "encoder_mask"
+    assert graph.output[2].type.tensor_type.elem_type == TensorProto.UINT8
+    assert not [v.name for v in graph.value_info if v.type.tensor_type.elem_type == TensorProto.UINT8]
+    assert all("encoder_mask" not in node.input for node in graph.node)
+
+    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    load_verify_module().verify_onnx_outputs(
+        encoder.eval(), session, torch.randn(2, 31, 80), torch.tensor([19, 31]),
+    )
+
+
 def test_external_data_stays_in_data_directory(tmp_path):
     module = load_export_module()
     path = tmp_path / "encoder.onnx"
