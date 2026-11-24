@@ -318,15 +318,12 @@ def build_engine(
         profile = builder.create_optimization_profile()
         for name in INPUT_NAMES:
             shapes = item[name]
-            if not profile.set_shape(
+            profile.set_shape(
                 name,
                 tuple(shapes["min"]),
                 tuple(shapes["opt"]),
                 tuple(shapes["max"]),
-            ):
-                raise RuntimeError(
-                    f"TensorRT rejected profile {item['name']} input {name}"
-                )
+            )
         config.add_optimization_profile(profile)
     manifest_path = output_dir / "manifest.json"
     manifest_path.unlink(missing_ok=True)

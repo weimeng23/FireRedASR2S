@@ -716,7 +716,8 @@ def test_build_removes_stale_manifest_when_serialization_fails(
 
     class FakeProfile:
         def set_shape(self, name, minimum, optimum, maximum):
-            return True
+            # The TensorRT Python binding returns None on success.
+            return None
 
     class FakeConfig:
         def set_flag(self, flag):
